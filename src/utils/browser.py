@@ -103,11 +103,65 @@ class BrowserManager:
 
         return context
 
-    async def new_page(self, context: BrowserContext) -> Page:
+    async def new_page(self, context: BrowserContext, block_resources: bool = True) -> Page:
+        """
+        block_resources=True でサインアップ時の帯域を最小化。
+        画像・フォント・動画・広告トラッキングをすべて遮断。
+        1垢あたりの通信量が ~1MB → プロキシコスト $0.001/垢 以下。
+        """
         page = await context.new_page()
         if stealth_async:
             await stealth_async(page)
+        if block_resources:
+            await self._setup_resource_blocking(page)
         return page
+
+    async def _setup_resource_blocking(self, page: Page):
+        """不要リソースを遮断して帯域節約。"""
+        # 遮断する拡張子
+        BLOCKED_EXTENSIONS = (
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+            ".woff", ".woff2", ".ttf", ".otf", ".eot",
+            ".mp4", ".webm", ".ogg", ".mp3",
+        )
+        # 遮断するホスト (広告・解析)
+        BLOCKED_HOSTS = (
+            "google-analytics.com", "googletagmanager.com",
+            "doubleclick.net", "googlesyndication.com",
+            "amplitude.com", "segment.io", "segment.com",
+            "hotjar.com", "clarity.ms",
+            "ads-twitter.com", "t.co/i/",
+        )
+        # 通す必要があるリソースタイプ
+        ALLOWED_TYPES = {"document", "script", "xhr", "fetch", "stylesheet", "websocket"}
+
+        async def handle_route(route):
+            req = route.request
+            rt = req.resource_type
+            url = req.url.lower()
+
+            # 必須リソースは通す
+            if rt in ALLOWED_TYPES:
+                # ただし広告ホストはスクリプトでも遮断
+                if any(h in url for h in BLOCKED_HOSTS):
+                    await route.abort()
+                    return
+                await route.continue_()
+                return
+
+            # 拡張子チェック
+            if any(url.split("?")[0].endswith(ext) for ext in BLOCKED_EXTENSIONS):
+                await route.abort()
+                return
+
+            # image / media / font タイプは遮断
+            if rt in ("image", "media", "font", "other"):
+                await route.abort()
+                return
+
+            await route.continue_()
+
+        await page.route("**/*", handle_route)
 
     @staticmethod
     def fingerprint_hash(username: str, extra: str = "") -> str:

@@ -81,7 +81,8 @@ class AccountFactory:
 
         try:
             context = await self.browser.new_context(proxy_url=proxy.url)
-            page = await self.browser.new_page(context)
+            # サインアップは画像・フォント等を遮断して帯域最小化 (~1MB/垢)
+            page = await self.browser.new_page(context, block_resources=True)
 
             success = await self._run_signup_flow(
                 page,
@@ -111,7 +112,8 @@ class AccountFactory:
 
             # プロフィール完成（アイコン・bio・場所）
             if self.config.factory.setup_profile:
-                profile_page = await self.browser.new_page(context)
+                # プロフィール設定は画像アップロードがあるので遮断なし
+                profile_page = await self.browser.new_page(context, block_resources=False)
                 await setup_profile(profile_page, username, display_name)
                 await profile_page.close()
 
