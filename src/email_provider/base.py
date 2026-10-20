@@ -1,6 +1,5 @@
 """
 メールプロバイダの抽象ベース。
-低コストで使えるものから順に実装する。
 """
 from abc import ABC, abstractmethod
 from typing import Optional

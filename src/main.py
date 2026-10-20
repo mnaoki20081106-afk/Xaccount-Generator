@@ -11,6 +11,7 @@ from .proxy.manager import ProxyManager
 from .auth.twofa import TwoFAManager
 from .factory.account_factory import AccountFactory
 from .utils.browser import BrowserManager
+from .email_provider.outlook import OutlookGenerator
 
 
 async def main():
@@ -35,16 +36,30 @@ async def main():
     factory = AccountFactory(
         config, proxy_manager, twofa_manager, browser_manager
     )
+    outlook_gen = OutlookGenerator(config, proxy_manager, browser_manager)
 
     logger.info("Xaccount-Generator started")
 
     try:
-        account = await factory.create_one()
-        if account:
-            account_id = await db.add_account(account)
-            logger.info(f"Saved account id={account_id} username={account.username}")
+        # モード切り替えは後でCLI引数にする。今は両方試せるようにする
+        import sys
+        mode = sys.argv[1] if len(sys.argv) > 1 else "x"
+
+        if mode == "outlook":
+            logger.info("Mode: Outlook generation")
+            result = await outlook_gen.create_one()
+            if result:
+                logger.info(f"Outlook result: {result['email']}")
+            else:
+                logger.warning("Outlook generation failed")
         else:
-            logger.warning("No account created this run")
+            logger.info("Mode: X account generation")
+            account = await factory.create_one()
+            if account:
+                account_id = await db.add_account(account)
+                logger.info(f"Saved account id={account_id} username={account.username}")
+            else:
+                logger.warning("No X account created this run")
     finally:
         await browser_manager.stop()
         await db.close()
