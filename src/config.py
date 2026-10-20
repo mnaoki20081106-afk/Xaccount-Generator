@@ -30,8 +30,11 @@ class SmsConfig(BaseModel):
 
 
 class CaptchaConfig(BaseModel):
-    provider: str = "none"               # capsolver / none
+    provider: str = "none"               # capsolver / local / none
     api_key: str = ""
+    # CDS Solver (cds-solver.com) APIキー — Arkose 解決のフォールバック
+    # ローカル解決 (arkose_solver) が失敗した場合のみ使用
+    cds_api_key: str = ""
 
 
 class FactoryConfig(BaseModel):

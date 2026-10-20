@@ -25,6 +25,7 @@ from ..config import AppConfig
 from ..utils.browser import BrowserManager
 from ..utils.profile import setup_profile
 from ..email_provider.mailtm import MailTmClient
+from .api_flow import XApiFlow, HAS_CURL
 
 # X サインアップで出る FunCaptcha の public key（動的抽出できなかった場合のフォールバック）
 X_FUNCAPTCHA_KEY_FALLBACK = "2F4F0B28-BC94-4271-8AD7-A51662E3C91C"
@@ -117,6 +118,60 @@ class AccountFactory:
             self._sms_mgr = SmsManager(self.config.sms)
 
     # ──────────────────────────────────────────
+    # API フロー (Playwright 不要)
+    # ──────────────────────────────────────────
+
+    async def _create_via_api_flow(
+        self,
+        email: str,
+        display_name: str,
+        mail_client,
+        proxy,
+    ) -> "Account | None":
+        """curl_cffi + onboarding/task.json で完結するサインアップ。"""
+        cds_key = getattr(self.config.captcha, "cds_api_key", None)
+        flow = XApiFlow(email=email, proxy_url=proxy.url, cds_api_key=cds_key)
+        flow.full_name = display_name
+
+        async def _fetch_code() -> str | None:
+            if mail_client is None:
+                return None
+            for _ in range(24):
+                await asyncio.sleep(5)
+                code = await mail_client.get_latest_code()
+                if code:
+                    return code
+            return None
+
+        ok = await flow.async_run(_fetch_code)
+        if not ok or not flow.auth_token:
+            return None
+
+        twofa_secret = None
+        if self.config.twofa.enabled:
+            raw = self.twofa_manager.generate_secret()
+            twofa_secret = self.twofa_manager.encrypt(raw)
+
+        account = Account(
+            username=flow.username or f"api_{int(time.time())}",
+            password=flow.password,
+            email=email,
+            phone=None,
+            twofa_secret=twofa_secret,
+            auth_token=flow.auth_token,
+            ct0=flow.ct0,
+            status=AccountStatus.CREATED,
+            proxy_id=proxy.session_id,
+            fingerprint_hash=BrowserManager.fingerprint_hash(flow.username or email),
+            cookies_path=None,
+            created_at=datetime.utcnow(),
+        )
+        logger.success(
+            f"[API] @{account.username} created auth_token={flow.auth_token[:8]}..."
+        )
+        return account
+
+    # ──────────────────────────────────────────
     # 公開 API
     # ──────────────────────────────────────────
 
@@ -134,6 +189,18 @@ class AccountFactory:
         if not await self.proxy_manager.health_check(proxy):
             logger.warning(f"[{username}] proxy unhealthy, skip")
             return None
+
+        # ── API フロー (Playwright 不要、高速) ──────────────────────────────
+        if HAS_CURL and not self.config.factory.use_phone:
+            api_account = await self._create_via_api_flow(
+                email, display_name, mail_client, proxy
+            )
+            if api_account:
+                if mail_client:
+                    await mail_client.close()
+                return api_account
+            logger.warning(f"[{username}] API フロー失敗 — Playwright にフォールバック")
+        # ────────────────────────────────────────────────────────────────────
 
         # SMS 番号を事前取得
         activation_id = phone_number = sms_client_used = None

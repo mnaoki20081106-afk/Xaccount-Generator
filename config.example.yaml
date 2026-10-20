@@ -37,9 +37,14 @@ sms:
     - "philippines"            # ~$0.08
 
 captcha:
-  provider: "capsolver"        # capsolver / none
-  # capsolver.com のAPIキー ($0.6/1000件、100垢で $0.30)
-  api_key: "YOUR_CAPSOLVER_KEY"
+  # "local"  → arkose-solver ローカル解決 (無料、外部APIキー不要)
+  # "capsolver" → capsolver.com ($0.6/1000件)
+  # "none"   → Arkose なし (SMS認証モードで迂回)
+  provider: "local"
+  api_key: ""                  # capsolver の場合のみ
+  # CDS Solver (cds-solver.com) — ローカル解決失敗時のフォールバック
+  # Telegram @keysolv_bot から無料キー取得可
+  cds_api_key: ""
 
 email:
   provider: ""                 # 空=mail.tm（無料）
