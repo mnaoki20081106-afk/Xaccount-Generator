@@ -1,0 +1,36 @@
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class AccountStatus(str, Enum):
+    CREATED = "created"
+    WARMING = "warming"
+    CLEAN = "clean"
+    SOFT_SHADOW = "soft_shadow"
+    HARD_SHADOW = "hard_shadow"
+    LOCKED = "locked"
+    SUSPENDED = "suspended"
+    SOLD = "sold"
+
+
+class Account(BaseModel):
+    id: Optional[int] = None
+    username: str
+    password: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    twofa_secret: Optional[str] = None  # encrypted
+    status: AccountStatus = AccountStatus.CREATED
+    shadow_score: float = 0.0
+    proxy_id: Optional[str] = None
+    fingerprint_hash: Optional[str] = None
+    cookies_path: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_action_at: Optional[datetime] = None
+    sold_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True

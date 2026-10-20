@@ -1,0 +1,43 @@
+# Xaccount-Generator 設定例
+# このファイルをコピーして config.yaml を作成し、値を埋めてください
+
+proxy:
+  provider: "iproyal"          # iproyal / proxycheap / other
+  # IPRoyalの場合の例（実際のエンドポイントはダッシュボードで確認）
+  host: "geo.iproyal.com"
+  port: 12321
+  username: "your_username"
+  password: "your_password"
+  country: "jp"
+  sticky_ttl_minutes: 30       # スティッキーセッション時間
+  max_accounts_per_ip: 5
+
+browser:
+  headless: true
+  slow_mo: 50                  # ms
+  default_timeout: 30000
+
+factory:
+  max_per_hour: 6
+  use_phone: false             # 初期はコスト抑制でfalse
+  captcha_provider: "capsolver" # または 2captcha / none
+  captcha_api_key: ""
+
+email:
+  provider: ""                 # 後で設定（temp mailや自前）
+  api_key: ""
+
+twofa:
+  enabled: true
+  encryption_key: "change-me-to-a-long-random-string"  # 必ず変更
+
+db:
+  path: "data/accounts.db"
+
+logging:
+  level: "INFO"
+  file: "data/bot.log"
+
+warmup:
+  min_days_before_sale: 10
+  actions_per_day_soft: 8

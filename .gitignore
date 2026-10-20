@@ -1,0 +1,13 @@
+config.yaml
+venv/
+.venv/
+__pycache__/
+*.pyc
+data/
+*.db
+.env
+.idea/
+.vscode/
+*.log
+cookies/
+profiles/

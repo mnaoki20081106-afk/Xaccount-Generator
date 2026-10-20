@@ -1,148 +1,121 @@
-# XアカウントファームBot 設計書
+# XアカウントファームBot 設計書（低コスト版）
 
 ## 1. 概要
 
-100〜1000個のX（Twitter）アカウントを自動生成し、自動運用・シャドウバン解除を行い、販売可能な状態まで育てるBotの設計。
+100〜1000個のXアカウントを自動生成・運用・販売するBot。
+**できるだけ低コスト**で回すことを優先。
 
+- プロキシ：IPRoyal などの安い住宅用プロキシ（日本）をメイン
 - 2FA（TOTP）対応
-- 日本IPの住宅用/モバイルプロキシ経由
 - 凍結対策を最優先
 - 販売用インベントリ管理まで含む
 
 ## 2. 全体アーキテクチャ
 
 ```
-[JP住宅用プロキシプール]
+[IPRoyal JP住宅用プロキシ]
           ↓
 [Account Factory] → [2FA Manager] → [Warm-up Engine]
           ↓                    ↓
 [Shadowban Detector] ← [Operation Engine]
           ↓
-[Inventory DB] → [販売API / パネル]
+[SQLite / PostgreSQL] → [販売用エクスポート]
 ```
 
-各モジュールは独立。1バッチが凍結しても全体が止まらない構成。
+初期はSQLiteで軽く開始。規模が大きくなったらPostgreSQLへ移行。
 
-## 3. 主要コンポーネント
+## 3. プロキシ方針（低コスト）
 
-### A. プロキシ層
-- 日本の住宅用プロキシ（モバイル優先 > 住宅用 > データセンター）
-- スティッキーセッション：アカウントごとに15〜40分保持後ソフトローテート
-- ヘルスチェック：5分間隔（地理情報・ASN・レイテンシ・ブラックリスト）
-- プロキシBAN時は7〜14日間そのIPをブラックホール化
-- プロバイダを2〜3社に分散して相関指紋を避ける
+- **メイン**: IPRoyal Residential（日本）
+  - 従量課金 or 安い帯域プランを使用
+  - スティッキーセッション対応を確認して使う
+- バックアップ候補: Proxy-Cheap, SOAX の安いプラン
+- 無料プロキシは使わない（成功率・生存率が低すぎるため）
+- 運用開始時は少容量からテストし、生存率を見てスケール
 
-### B. Account Factory（アカウント生成）
-生成優先順位：
-1. 電話番号認証（日本仮想番号 or 実SIM SMSプール）
-2. メール + 電話ハイブリッド
-3. 純メール（品質最低・凍結率高）
+### プロキシ管理ルール
+- アカウントごとにスティッキー（可能なら15〜40分）
+- ヘルスチェック：地理・応答速度・BAN検知
+- BANされたIPは一定期間ブラックリスト
 
-- ブラウザ指紋：Playwright + stealth / undetected-chromedriver で本物のChrome/Firefoxプロファイル
-- デバイス指紋：UA + WebGL + Canvas + Audio + Fonts をアカウントごとに一貫保持
-- 生成レート：IPあたり3〜8アカウント/時間（ランダム化）
-- Captcha：2captcha / Capsolver + ローカルモデルフォールバック
-- 出力：username, password, email, phone, cookies, localStorage, fingerprint hash, 作成日時, proxy_id
+## 4. 主要コンポーネント
 
-### C. 2FA Manager
-- TOTP（Google Authenticator形式）とSMS両対応
-- 生成時または後から有効化：secret生成 → DBに暗号化保存 → QR/secretをオペレータに返す
-- 自動ログイン時：secretからリアルタイムでTOTPコードを取得
-- バックアップコードも保存・ローテーション
-- 暗号化：AES-256-GCM（マスターキー + アカウントIDから派生）
+### A. Account Factory
+優先順位：
+1. メール + 可能な範囲で電話（コスト次第）
+2. 純メール（初期はこちらでコスト抑制）
 
-### D. Warm-up Engine（凍結耐性の核心）
-- Day 0〜3：閲覧 + いいね5〜15件、フォロー3〜8アカウント（ニッチ内）
-- Day 4〜10：徐々に投稿（1〜3/日）、リプライ、引用
-- Day 11以降：通常活動パターン
-- 行動モデル：人間らしい遅延（Poisson + 日本時間帯の概日リズム）、マウス移動、スクロール、タブ切替をシミュレート
-- コンテンツ：事前スクレイプした日本語ニッチ内容 + 軽微なAIリライト（重複検知回避）
-- 同一IPクラスタからの大量フォロー/いいねは絶対禁止
+- Playwright + stealth
+- 指紋隔離（アカウントごとにプロファイル）
+- 生成レート厳守（IPあたり少数）
+- Captchaは必要最小限（Capsolver等、使った分だけ課金）
 
-### E. Shadowban / Freeze Detector
-チェック項目：
-- 検索可視性（自分のツイートが検索に出るか）
-- リプライシャドウ（非フォロワーにリプライが見えるか）
-- タイムライン到達率（API or スクレイプでのインプレッション）
-- エンゲージメント急落
-- ログインチャレンジ / 強制認証
+### B. 2FA Manager
+- TOTP必須対応
+- secretを暗号化して保存
+- ログイン時に自動生成
 
-- 実行間隔：アカウントごとに6〜12時間
-- ステータス：Clean / Soft Shadow / Hard Shadow / Locked / Suspended
+### C. Warm-up Engine
+- 低活動から徐々に上げる
+- 日本時間帯に合わせた行動
+- コンテンツは事前用意 or 軽量生成
 
-回復プレイブック：
-- Soft：活動を48時間抑制 + アバター/bio変更 + 待機
-- Hard：5〜7日完全休息 + 新しいデバイス指紋 + 新しいプロキシ
-- Locked：電話再認証 or 自動アピール（成功率は限定的）
+### D. Shadowban Detector
+- 定期チェック
+- Soft / Hard で対応を分岐
 
-### F. Operation Engine
-- タスク：投稿・いいね・リツイート・リプライ・フォロー/アンフォロー・DM（慎重に）・スペース参加
-- スケジューラ：アカウントごとのキュー（優先度とクールダウン付き）
-- アンチパターン：アカウント間で同一アクションシーケンスを避ける
-- セッション管理：cookies + 指紋を再利用、必要なときだけ再認証
+### E. Operation & Inventory
+- 行動ログを残す
+- 一定基準を満たしたアカウントを「販売可能」にマーク
+- エクスポート機能（credentials + cookies + 2fa）
 
-### G. Inventory & Sales
-DBスキーマ概要：
-- accounts（id, username, pass, email, phone, 2fa_secret, status, age_days, shadow_score, proxy_id, created_at, sold_at, buyer_id）
-- actions_log
-- proxy_pool
-- sales
+## 5. 技術スタック（確定）
 
-販売API / 簡易Webパネル：
-- 年齢・認証レベル・シャドウスコア・ニッチ・2FA有無でフィルタ
-- 自動納品：暗号化zip（cookies + 認証情報 + 2FA secret）または直接転送
-- 価格帯：品質別（電話認証 + 30日クリーン > 純メール + 7日）
+- Python 3.12+
+- Playwright（stealth）
+- SQLite（初期）→ 必要ならPostgreSQL
+- httpx / aiohttp
+- pyotp（2FA）
+- cryptography（暗号化）
+- PyYAML / pydantic（設定）
+- loguru（ログ）
 
-## 4. 凍結・検知対策スタック
+## 6. ディレクトリ構成（実装）
 
-| 層 | 手法 | 備考 |
-|----|------|------|
-| ネットワーク | JP住宅用/モバイルプロキシ + スティッキー | データセンター回避 |
-| ブラウザ | 完全指紋隔離 + 本物ユーザープロファイル | Playwright stealth等 |
-| 行動 | 概日リズム + Poisson遅延 + 人間マウス/スクロール | 日本時間帯 |
-| コンテンツ | ユニーク日本語リライト + 画像バリエーション | 重複メディアハッシュ回避 |
-| レート | グローバル + IP単位 + アカウント単位のハードリミット | ランダム化 |
-| アカウント年齢 | 販売/ヘビー使用前に最低7〜14日ウォームアップ | |
-| 2FA | 作成後にTOTPを優先 | 後の電話依存を減らす |
-| 回復 | 自動休息 + 指紋リフレッシュ | |
+```
+src/
+  ├── main.py
+  ├── config.py
+  ├── models.py
+  ├── db.py
+  ├── proxy/
+  │   └── manager.py
+  ├── factory/
+  │   └── account_factory.py
+  ├── auth/
+  │   └── twofa.py
+  ├── warmup/
+  │   └── engine.py
+  ├── detector/
+  │   └── shadowban.py
+  └── utils/
+      ├── browser.py
+      └── crypto.py
+config.example.yaml
+requirements.txt
+data/          # DBやセッション置き場（gitignore）
+```
 
-## 5. 推奨技術スタック
+## 7. 進行方針
 
-- 言語：Python 3.12（Playwright / httpx / asyncio）または Node.js（Playwright）
-- ブラウザ自動化：Playwright + stealthプラグイン
-- DB：PostgreSQL + Redis（キュー・セッション）
-- キュー：Redis + Celery / BullMQ
-- 2FA：pyotp / otplib
-- プロキシ管理：自作 + BrightData / IPRoyal / SOAX（JP住宅用）
-- SMS：SMS-Activate / 5sim / 国内JPプロバイダ
-- 販売フロント：Next.js または FastAPI + HTMX
-- 暗号化：libsodium / cryptography
+1. 基盤（設定・DB・プロキシ管理）を固める
+2. ブラウザ指紋 + アカウント生成の骨格
+3. 2FA
+4. ウォームアップ
+5. 検知・運用
+6. 販売エクスポート
 
-## 6. 日次運用フロー
-
-1. プロキシヘルスチェック
-2. 新規アカウント生成（レート制限付き）
-3. ウォームアップキューへ割り当て
-4. 全アクティブアカウントで検知器実行
-5. クリーンアカウントのスケジュールアクション実行
-6. 準備完了アカウント（年齢 + スコア）を販売インベントリへ移動
-7. 販売・納品処理
-8. 全ログ記録。大量凍結時はアラート
-
-## 7. 現実的リスク
-
-- Xの検知は常に進化。強い住宅用プロキシと長いウォームアップなしの大量生成は高バーン率
-- 電話認証が現在最も強いシグナル。純メールファームは早く死ぬ
-- 販売後に停止されたアカウントはチャージバック・評判ダメージを生む → 販売後生存率を追跡
-- X利用規約違反。設計は私的運用を前提
-
-## 8. 次のステップ候補
-
-- 詳細DBスキーマ
-- Account Factory モジュール骨格
-- Warm-up 状態機械
-- Shadowban検知ロジック
-- 任意コンポーネントの完全コード
+低コストを維持しながら、動くものから順に積み上げる。
 
 ---
-作成日: 2026-10-20
+更新: 2026-10-20（IPRoyal低コスト方針に変更）
