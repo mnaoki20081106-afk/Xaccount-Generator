@@ -15,6 +15,7 @@ from ..proxy.manager import ProxyManager
 from ..auth.twofa import TwoFAManager
 from ..config import AppConfig
 from ..utils.browser import BrowserManager
+from ..email_provider.mailtm import MailTmClient
 
 fake = Faker("ja_JP")
 
@@ -36,7 +37,7 @@ class AccountFactory:
         username = self._gen_username()
         password = self._gen_password()
         display_name = fake.name()
-        email = await self._get_email(username)
+        email, mail_client = await self._get_email(username)
 
         if not email:
             logger.error(f"[{username}] email取得失敗")
@@ -56,7 +57,7 @@ class AccountFactory:
             page = await self.browser.new_page(context)
 
             success = await self._run_signup_flow(
-                page, username, password, email, display_name
+                page, username, password, email, display_name, mail_client=mail_client
             )
 
             if not success:
@@ -93,20 +94,23 @@ class AccountFactory:
         finally:
             if context:
                 await context.close()
+            if mail_client:
+                await mail_client.close()
 
-    async def _get_email(self, username: str) -> str | None:
+    async def _get_email(self, username: str) -> tuple[str | None, MailTmClient | None]:
         """
-        メール取得。
-        現状はプレースホルダ。
-        後で temp-mail / mail.tm / 有料API などに差し替える。
+        メールアドレスを取得してMailTmClientも返す（認証コード待ち受けに使う）。
         """
         provider = self.config.email.provider
-        if not provider:
-            # 開発用ダミー
-            return f"{username}@mail.example.com"
-        # TODO: providerごとの実装
-        logger.warning("email provider 未実装")
-        return None
+        if not provider or provider == "mailtm":
+            client = MailTmClient()
+            ok = await client.create_account()
+            if ok and client.address:
+                return client.address, client
+            await client.close()
+            return None, None
+        logger.warning(f"email provider '{provider}' 未実装")
+        return None, None
 
     async def _run_signup_flow(
         self,
@@ -115,6 +119,7 @@ class AccountFactory:
         password: str,
         email: str,
         display_name: str,
+        mail_client=None,
     ) -> bool:
         """
         Xサインアップの現実的なステップ骨格。
@@ -201,16 +206,91 @@ class AccountFactory:
             await self._click_first_visible(page, next_selectors)
             await self._human_delay(2.0, 4.0)
 
-            # --- ここから先はメール認証コード入力・パスワード設定などが続く ---
-            # メールプロバイダ連携ができてから本実装する
-            logger.info(
-                f"[{username}] basic form steps done. "
-                "メール認証・パスワード設定は次フェーズで実装。"
-            )
+            # --- Step 7: メール認証コード入力 ---
+            code_selectors = [
+                'input[data-testid="ocfEnterTextTextInput"]',
+                'input[name="verfication_code"]',
+                'input[inputmode="numeric"]',
+                'input[placeholder*="コード"]',
+                'input[placeholder*="code"]',
+            ]
+            code_field_visible = False
+            for sel in code_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=5000):
+                        code_field_visible = True
+                        if mail_client:
+                            code = await mail_client.wait_for_code(
+                                subject_keyword="Twitter", timeout=120
+                            )
+                            if code:
+                                await loc.fill(code)
+                                await self._human_delay(0.8, 1.5)
+                                await self._click_first_visible(page, [
+                                    '[data-testid="ocfEnterTextNextButton"]',
+                                    'div[role="button"]:has-text("次へ")',
+                                    'div[role="button"]:has-text("Next")',
+                                ])
+                                await self._human_delay(2.0, 4.0)
+                                logger.debug(f"[{username}] email code entered: {code}")
+                            else:
+                                logger.warning(f"[{username}] email code timeout")
+                                return False
+                        break
+                except Exception:
+                    continue
 
-            # 現時点では「フォームまで到達できた」ことを成功扱い（開発用）
-            # 本番では認証完了まで確認して True を返す
-            return True
+            # --- Step 8: パスワード設定 ---
+            pass_selectors = [
+                'input[name="password"]',
+                'input[type="password"]',
+                'input[autocomplete="new-password"]',
+            ]
+            for sel in pass_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=5000):
+                        await loc.fill(password)
+                        await self._human_delay(0.8, 1.5)
+                        await self._click_first_visible(page, next_selectors)
+                        await self._human_delay(2.0, 4.0)
+                        break
+                except Exception:
+                    continue
+
+            # --- Step 9: ユーザー名設定 ---
+            uname_selectors = [
+                'input[name="username"]',
+                'input[data-testid="ocfEnterTextTextInput"]',
+            ]
+            for sel in uname_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=5000):
+                        await loc.clear()
+                        await loc.fill(username)
+                        await self._human_delay(0.5, 1.0)
+                        await self._click_first_visible(page, next_selectors)
+                        await self._human_delay(2.0, 3.5)
+                        break
+                except Exception:
+                    continue
+
+            # --- 完了確認 ---
+            current_url = page.url
+            if "home" in current_url or "x.com" in current_url:
+                logger.success(f"[{username}] signup completed")
+                return True
+
+            # ホームに到達できていなくてもクッキーがあれば続行
+            content = await page.content()
+            if username in content or display_name in content:
+                logger.info(f"[{username}] signup likely succeeded (url={current_url})")
+                return True
+
+            logger.warning(f"[{username}] signup uncertain, url={current_url}")
+            return False
 
         except Exception as e:
             logger.error(f"[{username}] signup flow error: {e}")

@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  generator:
+    build: .
+    container_name: xaccount-generator
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["run", "--target", "100", "--gen-concurrency", "2", "--warmup-concurrency", "5"]
+
+  # 単発コマンド用（docker compose run tools generate --count 10）
+  tools:
+    build: .
+    container_name: xaccount-tools
+    profiles: ["tools"]
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    entrypoint: ["python", "-m", "src.main"]

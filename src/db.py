@@ -120,6 +120,52 @@ class Database:
         )
         await self.conn.commit()
 
+    async def update_shadow_score(self, account_id: int, score: float):
+        await self.conn.execute(
+            "UPDATE accounts SET shadow_score = ? WHERE id = ?",
+            (score, account_id),
+        )
+        await self.conn.commit()
+
+    async def update_last_action(self, account_id: int):
+        await self.conn.execute(
+            "UPDATE accounts SET last_action_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), account_id),
+        )
+        await self.conn.commit()
+
+    async def update_proxy(self, account_id: int, proxy_id: str):
+        await self.conn.execute(
+            "UPDATE accounts SET proxy_id = ? WHERE id = ?",
+            (proxy_id, account_id),
+        )
+        await self.conn.commit()
+
+    async def log_action(self, account_id: int, action: str, detail: str = ""):
+        await self.conn.execute(
+            "INSERT INTO action_log (account_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
+            (account_id, action, detail, datetime.utcnow().isoformat()),
+        )
+        await self.conn.commit()
+
+    async def get_action_count_today(self, account_id: int, action: str) -> int:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        cursor = await self.conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE account_id = ? AND action = ? AND created_at LIKE ?",
+            (account_id, action, f"{today}%"),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def get_account_by_id(self, account_id: int) -> Optional[Account]:
+        cursor = await self.conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (account_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_account(row)
+
     def _row_to_account(self, row) -> Account:
         return Account(
             id=row["id"],
