@@ -22,11 +22,22 @@ class BrowserConfig(BaseModel):
     default_timeout: int = 30000
 
 
+class SmsConfig(BaseModel):
+    provider: str = "5sim"               # 5sim / smsactivate / auto / none
+    api_key: str = ""                    # 5sim または primary プロバイダーのキー
+    api_key2: str = ""                   # auto モード時の secondary (smsactivate)
+    preferred_countries: list[str] = ["russia", "india", "indonesia", "philippines"]
+
+
+class CaptchaConfig(BaseModel):
+    provider: str = "none"               # capsolver / none
+    api_key: str = ""
+
+
 class FactoryConfig(BaseModel):
     max_per_hour: int = 6
-    use_phone: bool = False
-    captcha_provider: str = "none"
-    captcha_api_key: str = ""
+    use_phone: bool = True
+    setup_profile: bool = True           # サインアップ後にプロフィール完成
 
 
 class EmailConfig(BaseModel):
@@ -49,7 +60,7 @@ class LoggingConfig(BaseModel):
 
 
 class WarmupConfig(BaseModel):
-    min_days_before_sale: int = 10
+    min_days_before_sale: int = 21       # HStoraレベル: 21日以上
     actions_per_day_soft: int = 8
 
 
@@ -57,6 +68,8 @@ class AppConfig(BaseModel):
     proxy: ProxyConfig
     browser: BrowserConfig = BrowserConfig()
     factory: FactoryConfig = FactoryConfig()
+    sms: SmsConfig = SmsConfig()
+    captcha: CaptchaConfig = CaptchaConfig()
     email: EmailConfig = EmailConfig()
     twofa: TwoFAConfig
     db: DBConfig = DBConfig()

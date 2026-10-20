@@ -123,7 +123,7 @@ class Orchestrator:
 
         async def _warmup_one(account: Account):
             async with sem:
-                proxy = self.proxy_manager.get_proxy_for_account(account.username)
+                proxy = self.proxy_manager.get_warmup_proxy(account.username)
                 result = await self.warmup.run_daily_actions(account, proxy_url=proxy.url)
                 if "error" not in result:
                     await self.db.update_last_action(account.id)

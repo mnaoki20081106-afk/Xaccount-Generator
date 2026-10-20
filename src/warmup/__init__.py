@@ -16,6 +16,7 @@ from ..actions.follow import FollowAction
 from ..actions.like import LikeAction
 from ..utils.browser import BrowserManager
 from ..config import WarmupConfig
+from .content import random_tweet
 
 
 class WarmupPhase(str, Enum):
@@ -95,13 +96,7 @@ class WarmupScheduler:
         self.follow = follow_action
         self.like = like_action
         self.follow_targets = follow_targets or []
-        self.tweet_templates = tweet_templates or [
-            "今日もいい天気ですね",
-            "コーヒー飲んでひと息つく時間が好き",
-            "最近気になっていること",
-            "本読んでたら時間過ぎてた",
-            "散歩してきた",
-        ]
+        self.tweet_templates = tweet_templates  # None の場合は random_tweet() を使う
         self._counter = DailyActionCounter()
 
     async def run_daily_actions(
@@ -140,7 +135,11 @@ class WarmupScheduler:
                 and self._counter.can_do(account.id, "tweets", phase)
                 and random.random() < 0.6
             ):
-                text = random.choice(self.tweet_templates)
+                text = (
+                    random.choice(self.tweet_templates)
+                    if self.tweet_templates
+                    else random_tweet()
+                )
                 ok = await self.tweet.post(context, text, account)
                 if ok:
                     self._counter.increment(account.id, "tweets")

@@ -1,38 +1,53 @@
 # Xaccount-Generator 設定例
-# このファイルをコピーして config.yaml を作成し、値を埋めてください
-# cp config.example.yaml config.yaml
+# cp config.example.yaml config.yaml して値を埋める
 
 proxy:
-  provider: "iproyal"          # iproyal / proxycheap / brightdata / oxylabs
-  # IPRoyalの場合（ダッシュボードで確認）
+  provider: "iproyal"          # iproyal / proxycheap / brightdata
   host: "geo.iproyal.com"
   port: 12321
   username: "YOUR_PROXY_USER"
   password: "YOUR_PROXY_PASS"
   country: "jp"                # 日本IP固定
-  sticky_ttl_minutes: 30       # スティッキーセッション維持時間
+  sticky_ttl_minutes: 30
   max_accounts_per_ip: 3       # 同一IPに割り当てる最大垢数（少なめ推奨）
 
 browser:
-  headless: true               # 本番はtrue。デバッグ時はfalseで目視確認
-  slow_mo: 50                  # ms単位の操作遅延（人間らしさ）
-  default_timeout: 30000       # 要素待ちタイムアウト(ms)
+  headless: true               # 本番はtrue、デバッグ時はfalseで目視確認
+  slow_mo: 50
+  default_timeout: 30000
 
 factory:
-  max_per_hour: 5              # 1時間に生成する最大垢数（多すぎると凍結）
-  use_phone: false             # SMS認証を使うか（trueにするとsms-activate連携が必要）
-  captcha_provider: "capsolver" # capsolver / 2captcha / none
-  captcha_api_key: ""          # capsolverのAPIキー
+  max_per_hour: 5              # 1時間の最大生成数（多すぎると凍結）
+  use_phone: true              # SMS電話番号認証 (HStoraレベル品質に必要)
+  setup_profile: true          # サインアップ後にプロフィール（アイコン・bio）を設定
+
+sms:
+  # provider: "5sim" が最安。ダメなら "smsactivate" に切り替え。
+  # "auto" にすると api_key(5sim) と api_key2(smsactivate) を両方持ちにして残高ある方を使う。
+  provider: "5sim"
+  # 5sim.net APIキー (https://5sim.net/settings/profile)
+  # X用番号: $0.04〜0.08/件。100垢で最大 $8
+  api_key: "YOUR_5SIM_KEY"
+  # auto モード時の smsactivate バックアップ (省略可)
+  api_key2: ""
+  preferred_countries:         # 安い順に試す (5simの国名は英語)
+    - "russia"                 # ~$0.04
+    - "india"                  # ~$0.06
+    - "indonesia"              # ~$0.07
+    - "philippines"            # ~$0.08
+
+captcha:
+  provider: "capsolver"        # capsolver / none
+  # capsolver.com のAPIキー ($0.6/1000件、100垢で $0.30)
+  api_key: "YOUR_CAPSOLVER_KEY"
 
 email:
-  # mail.tm を使う場合は provider を空のまま（自動でmail.tmを使用）
-  # outlook.com を生成する場合は "outlook" を指定
-  provider: ""
+  provider: ""                 # 空=mail.tm（無料）
   api_key: ""
 
 twofa:
   enabled: true
-  # 必ずランダムな長い文字列に変更すること（2FAシークレットの暗号化に使用）
+  # 必ず32文字以上のランダム文字列に変更すること
   encryption_key: "change-this-to-a-long-random-string-at-least-32-chars"
 
 db:
@@ -43,5 +58,5 @@ logging:
   file: "data/bot.log"
 
 warmup:
-  min_days_before_sale: 10    # 生成後X日以上ウォームアップしてから「使える垢」とみなす
-  actions_per_day_soft: 8     # 1日の行動上限（soft limit）
+  min_days_before_sale: 21    # HStoraレベル: 21日以上
+  actions_per_day_soft: 8
