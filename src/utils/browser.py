@@ -106,7 +106,7 @@ class BrowserManager:
     async def new_page(self, context: BrowserContext, block_resources: bool = True) -> Page:
         """
         block_resources=True でサインアップ時の帯域を最小化。
-        画像・フォント・動画・広告トラッキングをすべて遮断。
+        画像・動画・広告トラッキングを遮断。フォントは Captcha スコア対策で通す。
         1垢あたりの通信量が ~1MB → プロキシコスト $0.001/垢 以下。
         """
         page = await context.new_page()
@@ -118,10 +118,9 @@ class BrowserManager:
 
     async def _setup_resource_blocking(self, page: Page):
         """不要リソースを遮断して帯域節約。"""
-        # 遮断する拡張子
+        # 遮断する拡張子 — フォント (.woff/.ttf) は Captcha スコア対策で通す
         BLOCKED_EXTENSIONS = (
-            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-            ".woff", ".woff2", ".ttf", ".otf", ".eot",
+            ".png", ".jpg", ".jpeg", ".gif", ".webp",
             ".mp4", ".webm", ".ogg", ".mp3",
         )
         # 遮断するホスト (広告・解析)
@@ -154,8 +153,8 @@ class BrowserManager:
                 await route.abort()
                 return
 
-            # image / media / font タイプは遮断
-            if rt in ("image", "media", "font", "other"):
+            # image / media タイプは遮断 (font は通す)
+            if rt in ("image", "media", "other"):
                 await route.abort()
                 return
 

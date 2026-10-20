@@ -8,7 +8,9 @@ from loguru import logger
 
 X_PRODUCT = "twitter"
 
-CHEAP_COUNTRIES = ["russia", "india", "indonesia", "philippines", "ukraine", "kazakhstan"]
+# 西側を優先 — 安国 (russia/india 等) は X に弾かれやすい
+CHEAP_COUNTRIES = ["usa", "england", "germany", "france", "netherlands",
+                   "ukraine", "india", "indonesia", "philippines"]
 
 
 class FiveSimClient:
