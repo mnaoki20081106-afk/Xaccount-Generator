@@ -1,10 +1,12 @@
 """
 アカウント生成。
-Playwrightでブラウザを起動し、プロキシ経由でX登録フローの骨格を実行する。
-実際のセレクタやフローはXのUI変更に合わせて随時調整が必要。
+Playwrightでプロキシ経由のX登録フローを実行する。
+セレクタはXのUI変更で壊れやすいので、動作確認しながら調整すること。
 """
 from datetime import datetime
 from pathlib import Path
+import random
+import asyncio
 from loguru import logger
 from faker import Faker
 
@@ -33,12 +35,16 @@ class AccountFactory:
     async def create_one(self) -> Account | None:
         username = self._gen_username()
         password = self._gen_password()
-        email = f"{username}@example.com"  # TODO: 本物のメールプロバイダに差し替え
+        display_name = fake.name()
+        email = await self._get_email(username)
+
+        if not email:
+            logger.error(f"[{username}] email取得失敗")
+            return None
 
         proxy = self.proxy_manager.get_proxy_for_account(username)
         logger.info(f"[{username}] proxy session={proxy.session_id}")
 
-        # ヘルスチェック（失敗したらスキップ）
         healthy = await self.proxy_manager.health_check(proxy)
         if not healthy:
             logger.warning(f"[{username}] proxy unhealthy, skip")
@@ -49,15 +55,14 @@ class AccountFactory:
             context = await self.browser.new_context(proxy_url=proxy.url)
             page = await self.browser.new_page(context)
 
-            # --- X登録フロー（骨格） ---
-            # 実際のセレクタはXの現在のUIに合わせて書き換えること
-            success = await self._run_signup_flow(page, username, password, email)
+            success = await self._run_signup_flow(
+                page, username, password, email, display_name
+            )
 
             if not success:
                 logger.warning(f"[{username}] signup flow failed")
                 return None
 
-            # cookies保存
             cookies_dir = Path("data/cookies")
             cookies_dir.mkdir(parents=True, exist_ok=True)
             cookies_path = str(cookies_dir / f"{username}.json")
@@ -89,32 +94,152 @@ class AccountFactory:
             if context:
                 await context.close()
 
+    async def _get_email(self, username: str) -> str | None:
+        """
+        メール取得。
+        現状はプレースホルダ。
+        後で temp-mail / mail.tm / 有料API などに差し替える。
+        """
+        provider = self.config.email.provider
+        if not provider:
+            # 開発用ダミー
+            return f"{username}@mail.example.com"
+        # TODO: providerごとの実装
+        logger.warning("email provider 未実装")
+        return None
+
     async def _run_signup_flow(
-        self, page, username: str, password: str, email: str
+        self,
+        page,
+        username: str,
+        password: str,
+        email: str,
+        display_name: str,
     ) -> bool:
         """
-        Xのサインアップフロー骨格。
-        現状はページ到達確認まで。実際の入力・送信は次のステップで実装する。
+        Xサインアップの現実的なステップ骨格。
+
+        注意:
+        - XはUI・セレクタを頻繁に変える
+        - 電話番号要求・Captcha・異常検知が挟まる
+        - このコードは「流れ」を示すもの。実環境でセレクタを合わせて調整が必要
         """
         try:
-            await page.goto("https://x.com/i/flow/signup", wait_until="domcontentloaded")
-            logger.debug(f"[{username}] reached signup page")
+            await page.goto(
+                "https://x.com/i/flow/signup",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await self._human_delay(1.5, 3.0)
+            logger.debug(f"[{username}] signup page loaded")
 
-            # ここから先はXのUIに依存するセレクタを使って実装する
-            # 例（仮）:
-            # await page.get_by_text("アカウントを作成").click()
-            # await page.locator('input[name="name"]').fill(fake.name())
-            # await page.locator('input[name="email"]').fill(email)
-            # ...
+            # --- Step 1: 「アカウントを作成」系のボタンを探す ---
+            # 言語によってテキストが違うので複数候補を試す
+            create_selectors = [
+                'div[role="button"]:has-text("アカウントを作成")',
+                'div[role="button"]:has-text("Create account")',
+                'span:has-text("アカウントを作成")',
+                'span:has-text("Create account")',
+                '[data-testid="signupButton"]',
+            ]
+            clicked = await self._click_first_visible(page, create_selectors)
+            if clicked:
+                await self._human_delay(1.0, 2.0)
 
-            # 現時点では到達できたことを成功とみなす（テスト用）
-            # 本番では実際にアカウントが作れたかで判定する
-            await page.wait_for_timeout(2000)
+            # --- Step 2: 名前入力 ---
+            name_selectors = [
+                'input[name="name"]',
+                'input[autocomplete="name"]',
+                'input[data-testid="ocfEnterTextTextInput"]',
+            ]
+            if not await self._fill_first_visible(page, name_selectors, display_name):
+                logger.warning(f"[{username}] name input not found")
+                # 続行を試みる
+
+            await self._human_delay(0.8, 1.5)
+
+            # --- Step 3: メールに切り替え（電話がデフォルトの場合） ---
+            email_switch_selectors = [
+                'span:has-text("代わりにメールアドレスを登録する")',
+                'span:has-text("Use email instead")',
+                'div[role="button"]:has-text("メール")',
+            ]
+            await self._click_first_visible(page, email_switch_selectors)
+            await self._human_delay(0.5, 1.2)
+
+            # --- Step 4: メール入力 ---
+            email_selectors = [
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[autocomplete="email"]',
+            ]
+            if not await self._fill_first_visible(page, email_selectors, email):
+                logger.warning(f"[{username}] email input not found")
+
+            await self._human_delay(0.8, 1.5)
+
+            # --- Step 5: 生年月日（必要なら） ---
+            # Xは月・日・年のセレクトが多い
+            try:
+                # 月
+                month = random.randint(1, 12)
+                day = random.randint(1, 28)
+                year = random.randint(1988, 2002)
+                # セレクトの実装はUI依存のため、ここではログのみ
+                logger.debug(f"[{username}] birthdate candidate {year}-{month:02d}-{day:02d}")
+            except Exception:
+                pass
+
+            await self._human_delay(0.5, 1.0)
+
+            # --- Step 6: 次へ / Next ---
+            next_selectors = [
+                'div[role="button"]:has-text("次へ")',
+                'div[role="button"]:has-text("Next")',
+                '[data-testid="ocfEnterTextNextButton"]',
+            ]
+            await self._click_first_visible(page, next_selectors)
+            await self._human_delay(2.0, 4.0)
+
+            # --- ここから先はメール認証コード入力・パスワード設定などが続く ---
+            # メールプロバイダ連携ができてから本実装する
+            logger.info(
+                f"[{username}] basic form steps done. "
+                "メール認証・パスワード設定は次フェーズで実装。"
+            )
+
+            # 現時点では「フォームまで到達できた」ことを成功扱い（開発用）
+            # 本番では認証完了まで確認して True を返す
             return True
 
         except Exception as e:
             logger.error(f"[{username}] signup flow error: {e}")
             return False
+
+    async def _click_first_visible(self, page, selectors: list[str]) -> bool:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=2000):
+                    await loc.click()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _fill_first_visible(self, page, selectors: list[str], value: str) -> bool:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=2000):
+                    await loc.fill(value)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _human_delay(self, min_s: float, max_s: float):
+        await asyncio.sleep(random.uniform(min_s, max_s))
 
     def _gen_username(self) -> str:
         base = fake.user_name().replace(".", "").replace("_", "")[:8]
