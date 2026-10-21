@@ -86,12 +86,12 @@ def generate_device():
     net = _pick(p["network"])
     win = _window_on(p["base"], screen)
     color_depth = win["screen"].get("colorDepth", CHROME_COLOR_DEPTH)
+    sc = win["screen"]
     return {
         **win,
-        "color_depth": color_depth,
+        # camelCase keys (browser.py / Playwright use)
         "hardwareConcurrency": cores,
         "deviceMemory": memory,
-        "device_memory": memory,
         "jsHeapSizeLimit": js_heap_size_limit(memory),
         "connection": {
             "effectiveType": "4g",
@@ -101,6 +101,24 @@ def generate_device():
         },
         "glVendor": gpu.get("glVendor") or gpu.get("vendor", ""),
         "glRenderer": gpu.get("glRenderer") or gpu.get("renderer", ""),
+        # snake_case aliases (bda.py use)
+        "color_depth": color_depth,
+        "device_memory": memory,
+        "device_pixel_ratio": win["devicePixelRatio"],
+        "screen_width": sc["width"],
+        "screen_height": sc["height"],
+        "avail_width": sc["availWidth"],
+        "avail_height": sc["availHeight"],
+        "hardware_concurrency": cores,
+        "inner_width": win["innerWidth"],
+        "inner_height": win["innerHeight"],
+        "outer_width": win["outerWidth"],
+        "outer_height": win["outerHeight"],
+        "gl_vendor": gpu.get("glVendor") or gpu.get("vendor", ""),
+        "gl_renderer": gpu.get("glRenderer") or gpu.get("renderer", ""),
+        "downlink": net["downlink"],
+        "rtt": net["rtt"],
+        "save_data": net["saveData"],
     }
 
 

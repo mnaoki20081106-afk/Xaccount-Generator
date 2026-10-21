@@ -43,11 +43,10 @@ _BASE = "https://x.com/i/api"
 # curl_cffi の Chrome バージョン（api_flow.py と揃える）
 _IMPERSONATE = "chrome136"
 
-# twikit と同一 UA（macOS Safari）— X 側のボット検出回避
+# chrome136 フィンガープリントに合わせた Chrome UA（Safari UA は JA3 不一致でボット検出される）
 _USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.5 Safari/605.1.15"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
 

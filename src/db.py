@@ -1,6 +1,6 @@
 import aiosqlite
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from loguru import logger
 
@@ -174,7 +174,7 @@ class Database:
     async def update_last_action(self, account_id: int):
         await self.conn.execute(
             "UPDATE accounts SET last_action_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), account_id),
+            (datetime.now(timezone.utc).isoformat(), account_id),
         )
         await self.conn.commit()
 
@@ -188,12 +188,12 @@ class Database:
     async def log_action(self, account_id: int, action: str, detail: str = ""):
         await self.conn.execute(
             "INSERT INTO action_log (account_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
-            (account_id, action, detail, datetime.utcnow().isoformat()),
+            (account_id, action, detail, datetime.now(timezone.utc).isoformat()),
         )
         await self.conn.commit()
 
     async def get_action_count_today(self, account_id: int, action: str) -> int:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cursor = await self.conn.execute(
             "SELECT COUNT(*) FROM action_log WHERE account_id = ? AND action = ? AND created_at LIKE ?",
             (account_id, action, f"{today}%"),

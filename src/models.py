@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -29,7 +29,7 @@ class Account(BaseModel):
     proxy_id: Optional[str] = None
     fingerprint_hash: Optional[str] = None
     cookies_path: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_action_at: Optional[datetime] = None
     sold_at: Optional[datetime] = None
     notes: Optional[str] = None

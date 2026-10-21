@@ -199,9 +199,9 @@ class XApiFlow:
                 f"Arkose ローカル解決 suppressed={result.suppressed} "
                 f"timings={result.timings}"
             )
-            # suppressed=False (sup=1) のトークンは X で弾かれやすい → フォールバック
+            # suppressed=True (sup=1) のトークンは X で弾かれやすい → フォールバック
             if result.suppressed:
-                logger.warning("Arkose ローカルトークン suppressed=False — CDS にフォールバック")
+                logger.warning("Arkose ローカルトークン suppressed=True — CDS にフォールバック")
                 return None
             return result.token
         except Exception as e:

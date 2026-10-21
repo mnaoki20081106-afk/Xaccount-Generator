@@ -86,7 +86,7 @@ class OSSArkoseSolver:
             return result.token
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await asyncio.wait_for(
                 loop.run_in_executor(None, _run),
                 timeout=float(timeout),

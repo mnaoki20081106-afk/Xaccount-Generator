@@ -9,7 +9,7 @@ API モード: メモリ ~20MB、プロキシ通信 ~50KB/アクション
 """
 import asyncio
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from loguru import logger
@@ -44,7 +44,9 @@ PHASE_LIMITS = {
 
 
 def get_phase(created_at: datetime) -> WarmupPhase:
-    age_days = (datetime.utcnow() - created_at).days
+    now = datetime.now(timezone.utc)
+    ca = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+    age_days = (now - ca).days
     if age_days < 7:
         return WarmupPhase.OBSERVE
     elif age_days < 14:
@@ -57,7 +59,7 @@ ACTIVE_HOURS_UTC = list(range(0, 14))  # 09:00-23:00 JST
 
 
 def is_active_hour() -> bool:
-    return datetime.utcnow().hour in ACTIVE_HOURS_UTC
+    return datetime.now(timezone.utc).hour in ACTIVE_HOURS_UTC
 
 
 class WarmupScheduler:

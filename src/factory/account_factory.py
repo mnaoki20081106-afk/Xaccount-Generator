@@ -194,7 +194,8 @@ class AccountFactory:
             return None
 
         # ── API フロー (Playwright 不要、高速) ────────────────────────────────
-        if HAS_CURL and not self.config.factory.use_phone:
+        # use_phone=True でも API フローは SMS ステップを内部処理するため実行する
+        if HAS_CURL:
             api_account = await self._create_via_api_flow(
                 email, display_name, mail_client, proxy
             )

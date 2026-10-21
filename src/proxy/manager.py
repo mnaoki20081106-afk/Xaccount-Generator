@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -35,11 +35,16 @@ _CHECK_URLS = [
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _parse_dt(s: str | None) -> Optional[datetime]:
-    return datetime.fromisoformat(s) if s else None
+    if not s:
+        return None
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 class ProxySession:
@@ -74,10 +79,10 @@ class ProxySession:
 
     def is_circuit_open(self) -> bool:
         until = self.circuit_open_until
-        if until and datetime.utcnow() < until:
+        if until and datetime.now(timezone.utc) < until:
             return True
         # 期限切れ → 自動リセット
-        if until and datetime.utcnow() >= until:
+        if until and datetime.now(timezone.utc) >= until:
             self._d["circuit_open_until"] = None
             self._d["consecutive_failures"] = 0
         return False
@@ -86,7 +91,7 @@ class ProxySession:
         fails = self.consecutive_failures + 1
         self._d["consecutive_failures"] = fails
         if fails >= CIRCUIT_THRESHOLD:
-            until = datetime.utcnow() + timedelta(minutes=CIRCUIT_RESET_MINUTES)
+            until = datetime.now(timezone.utc) + timedelta(minutes=CIRCUIT_RESET_MINUTES)
             self._d["circuit_open_until"] = until.isoformat()
             logger.warning(
                 f"Proxy session={self.session_id} circuit OPEN "
@@ -110,7 +115,7 @@ class ProxySession:
 
     def is_cooling(self) -> bool:
         cu = self.cooldown_until
-        return bool(cu and datetime.utcnow() < cu)
+        return bool(cu and datetime.now(timezone.utc) < cu)
 
     def is_ready_for_signup(self, max_per_ip: int) -> bool:
         if self.is_cooling():
@@ -121,7 +126,7 @@ class ProxySession:
             return False
         last = self.last_signup_at
         if last:
-            elapsed = (datetime.utcnow() - last).total_seconds() / 3600
+            elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 3600
             if elapsed < SIGNUP_INTERVAL_HOURS:
                 return False
         return True
@@ -130,7 +135,7 @@ class ProxySession:
         self._d["account_count"] = self.account_count + 1
         self._d["last_signup_at"] = _now_iso()
         if self._d["account_count"] >= max_per_ip:
-            until = datetime.utcnow() + timedelta(weeks=COOLDOWN_WEEKS)
+            until = datetime.now(timezone.utc) + timedelta(weeks=COOLDOWN_WEEKS)
             self._d["cooldown_until"] = until.isoformat()
             logger.info(
                 f"Proxy session={self.session_id} 上限到達 → "
@@ -139,7 +144,7 @@ class ProxySession:
 
     def maybe_reset_cooldown(self):
         cu = self.cooldown_until
-        if cu and datetime.utcnow() >= cu:
+        if cu and datetime.now(timezone.utc) >= cu:
             self._d["account_count"] = 0
             self._d["cooldown_until"] = None
             self._d["last_signup_at"] = None

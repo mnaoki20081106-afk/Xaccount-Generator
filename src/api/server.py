@@ -228,9 +228,14 @@ async def pop_accounts(request: Request, body_model: PopRequest):
         candidates = candidates + soft
 
     if body_model.min_warmup_days > 0:
-        import datetime
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=body_model.min_warmup_days)
-        candidates = [a for a in candidates if a.created_at and a.created_at <= cutoff]
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(days=body_model.min_warmup_days)
+        candidates = [
+            a for a in candidates
+            if a.created_at and (
+                a.created_at if a.created_at.tzinfo else a.created_at.replace(tzinfo=timezone.utc)
+            ) <= cutoff
+        ]
 
     selected = candidates[: body_model.count]
     if not selected:

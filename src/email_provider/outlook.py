@@ -474,8 +474,8 @@ class OutlookClient:
         # CapBypass を優先 (Outlook FunCaptcha の成功率が高い)
         # CaptchaManager の場合は内部プロバイダーから CapBypassClient を探す
         capbypass = None
-        if hasattr(self.captcha_client, "_providers"):
-            for entry in self.captcha_client._providers:
+        if hasattr(self.captcha_client, "_entries"):
+            for entry in self.captcha_client._entries:
                 if type(entry.client).__name__ == "CapBypassClient" and not entry.disabled:
                     capbypass = entry.client
                     break
