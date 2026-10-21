@@ -10,7 +10,7 @@ import re
 import secrets
 import string
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -167,7 +167,7 @@ class AccountFactory:
             proxy_id=proxy.session_id,
             fingerprint_hash=BrowserManager.fingerprint_hash(flow.username or email),
             cookies_path=None,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         logger.success(
             f"[API] @{account.username} created auth_token={flow.auth_token[:8]}..."
@@ -271,7 +271,7 @@ class AccountFactory:
                 proxy_id=proxy.session_id,
                 fingerprint_hash=BrowserManager.fingerprint_hash(username),
                 cookies_path=cookie_path,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             logger.success(
                 f"[{username}] created phone={'yes' if phone_number else 'no'} "

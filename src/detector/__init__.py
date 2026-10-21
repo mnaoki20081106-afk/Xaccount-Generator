@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -56,7 +56,7 @@ class BanStatus:
 
     def __post_init__(self):
         if self.checked_at is None:
-            self.checked_at = datetime.utcnow()
+            self.checked_at = datetime.now(timezone.utc)
 
     @property
     def shadow_score(self) -> float:
