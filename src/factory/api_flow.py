@@ -255,20 +255,16 @@ class XApiFlow:
         return None
 
     def _solve_arkose(self, blob: str) -> Optional[str]:
-        """CDS → ローカルの順。CDS がキー設定済みなら優先 (成功率が高い)。
-        ローカルは BDA 固定値が多く X に拒否されやすいので「無料試行」扱い。
+        """ローカル OSS (無料) → CDS (有料) の順。コスト最小化優先。
+        suppressed トークンはローカルで None 扱いなので自動的に CDS へ落ちる。
         """
-        if self.cds_api_key:
-            token = self._solve_arkose_cds(blob)
-            if token:
-                return token
-            logger.warning("CDS 失敗 — ローカル solver にフォールバック")
         token = self._solve_arkose_local(blob)
         if token:
             return token
-        # CDS キーなし & ローカル失敗の場合、CDS を再試行 (キーが別経路で入っていれば)
-        if not self.cds_api_key:
-            logger.error("Arkose: CDS キー未設定かつローカル失敗。config.captcha.cds_api_key を設定推奨")
+        if self.cds_api_key:
+            logger.info("Arkose: ローカル失敗 → CDS Solver にフォールバック")
+            return self._solve_arkose_cds(blob)
+        logger.error("Arkose: ローカル失敗かつ CDS キー未設定。config.captcha.cds_api_key を設定推奨")
         return None
 
     # ------------------------------------------------------------------

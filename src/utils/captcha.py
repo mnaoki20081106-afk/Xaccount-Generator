@@ -30,6 +30,76 @@ def _proxy_parts(proxy: str | None) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
+# OSSArkoseSolver — ローカル無料 Arkose solver
+# ──────────────────────────────────────────────────────────────
+
+class OSSArkoseSolver:
+    """
+    src/arkose_solver/ のローカル実装で FunCaptcha を無料解決。
+    CaptchaManager の先頭プロバイダーとして登録し、失敗時のみ有料へフォールバック。
+
+    suppressed=True (sup=1) のトークンは X が拒否しやすいため None を返し
+    次のプロバイダーへ渡す。solve() は同期なので ThreadPoolExecutor で実行。
+    """
+    name = "OSSArkose"
+    _SURL = "https://client-api.arkoselabs.com"
+
+    def __init__(self, user_agent: str | None = None):
+        self.user_agent = user_agent
+
+    async def get_balance(self) -> float:
+        return float("inf")  # 無料なので残高概念なし
+
+    async def solve_funcaptcha(
+        self,
+        website_url: str,
+        website_public_key: str,
+        proxy: str | None = None,
+        timeout: int = 120,
+        blob: str = "",
+        **_,
+    ) -> str | None:
+        try:
+            from ..arkose_solver import Solver
+        except ImportError:
+            logger.warning("OSSArkose: arkose_solver モジュールが見つかりません")
+            return None
+
+        import asyncio
+
+        def _run() -> str | None:
+            solver = Solver(
+                surl=self._SURL,
+                public_key=website_public_key,
+                site=website_url,
+                proxy=proxy,
+                user_agent=self.user_agent,
+                language="ja",
+            )
+            if blob:
+                solver.data_blob = blob
+            result = solver.solve()
+            if result.suppressed:
+                logger.warning("OSSArkose: suppressed トークン (sup=1) — 有料へフォールバック")
+                return None
+            logger.info(f"OSSArkose: 解決成功 timings={result.timings}")
+            return result.token
+
+        try:
+            loop = asyncio.get_event_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, _run),
+                timeout=float(timeout),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OSSArkose: タイムアウト")
+            return None
+        except Exception as e:
+            logger.warning(f"OSSArkose: 解決失敗: {e}")
+            return None
+
+
+# ──────────────────────────────────────────────────────────────
 # CapSolver
 # ──────────────────────────────────────────────────────────────
 
@@ -473,7 +543,7 @@ class CapBypassClient:
 # CaptchaManager — 自動フォールバック付きファサード
 # ──────────────────────────────────────────────────────────────
 
-_AnyClient = CapSolverClient | TwoCaptchaClient | AntiCaptchaClient | CapBypassClient
+_AnyClient = OSSArkoseSolver | CapSolverClient | TwoCaptchaClient | AntiCaptchaClient | CapBypassClient
 
 
 @dataclass
@@ -641,10 +711,18 @@ def get_captcha_client(config) -> _AnyClient | None:
 def get_captcha_manager(config) -> CaptchaManager | None:
     """
     設定から CaptchaManager を構築。
-    primary → fallback の順でプロバイダーを登録。
-    両方 none / キーなし → None
+    OSS (無料) → primary → fallback の順でプロバイダーを登録。
+    OSSのみでも動作 (paid キーなし = None にならない)。
     """
     clients: list[_AnyClient] = []
+
+    # OSSソルバーを先頭に (無料、curl_cffi が必要)
+    try:
+        from ..arkose_solver import Solver as _  # availability check
+        clients.append(OSSArkoseSolver())
+        logger.debug("CaptchaManager: OSSArkose を先頭プロバイダーとして登録 (無料)")
+    except ImportError:
+        logger.debug("CaptchaManager: arkose_solver 未インストール、OSS をスキップ")
 
     primary = _make_client(config.provider, config.api_key)
     if primary:
