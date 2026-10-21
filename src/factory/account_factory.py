@@ -114,8 +114,8 @@ class AccountFactory:
         self._init_clients()
 
     def _init_clients(self):
-        from ..utils.captcha import get_captcha_client
-        self._captcha_client = get_captcha_client(self.config.captcha)
+        from ..utils.captcha import get_captcha_manager
+        self._captcha_client = get_captcha_manager(self.config.captcha)
         if self.config.factory.use_phone:
             from ..sms.manager import SmsManager
             self._sms_mgr = SmsManager(self.config.sms)

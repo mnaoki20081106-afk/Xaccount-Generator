@@ -162,6 +162,7 @@ class ProxyManager:
                 raw = json.loads(STATE_FILE.read_text())
                 self._sessions = raw.get("sessions", {})
                 self._account_map = raw.get("account_map", {})
+                self._warmup_map = raw.get("warmup_map", {})
                 logger.debug(f"Proxy state loaded: {len(self._sessions)} sessions")
             except Exception as e:
                 logger.warning(f"proxy state load error: {e}")
@@ -170,7 +171,11 @@ class ProxyManager:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(
             json.dumps(
-                {"sessions": self._sessions, "account_map": self._account_map},
+                {
+                    "sessions": self._sessions,
+                    "account_map": self._account_map,
+                    "warmup_map": self._warmup_map,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
@@ -266,7 +271,8 @@ class ProxyManager:
                     r = await client.get(check_url)
                     if r.status_code == 200:
                         try:
-                            ip = r.json().get("ip") or r.json().get("query") or "?"
+                            data = r.json()
+                            ip = data.get("ip") or data.get("query") or "?"
                         except Exception:
                             ip = r.text.strip()[:20]
                         session.record_health_success(ip)

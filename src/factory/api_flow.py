@@ -812,24 +812,21 @@ class XApiFlow:
         """
         email_code_fetcher_async: async callable -> str | None
         curl_cffi の同期コードを executor で wrap。
+        email_code_fetcher_async は main loop 上で実行するため
+        run_coroutine_threadsafe で main loop に投げ返す。
         """
-        loop = asyncio.get_event_loop()
-
-        async def _code_sync_wrapper():
-            return await email_code_fetcher_async()
+        loop = asyncio.get_running_loop()
 
         def _sync_run():
-            code_holder = []
-
-            async def _fetch():
-                code_holder.append(await _code_sync_wrapper())
-
-            loop2 = asyncio.new_event_loop()
-            loop2.run_until_complete(_fetch())
-            loop2.close()
-
             def fetcher():
-                return code_holder[0] if code_holder else None
+                future = asyncio.run_coroutine_threadsafe(
+                    email_code_fetcher_async(), loop
+                )
+                try:
+                    return future.result(timeout=200)
+                except Exception as e:
+                    logger.error(f"email_code_fetcher error in thread: {e}")
+                    return None
 
             return self.run(fetcher)
 
