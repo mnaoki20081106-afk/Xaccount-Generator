@@ -139,6 +139,8 @@ class XApiFlow:
         self.flow_token: Optional[str] = None
         self.js_instrumentation: Optional[str] = None
         self.arkose_token: Optional[str] = None
+        # subtask_id ごとの出現回数 (衝突リトライ / 再チャレンジ検出)
+        self._seen_subtasks: dict[str, int] = {}
 
         # セッション: UA / sec-ch-ua / impersonate を全部 Chrome major で揃える
         self._session = curl_requests.Session(impersonate=IMPERSONATE_VERSION)
@@ -545,6 +547,10 @@ class XApiFlow:
 
         # Arkose チャレンジ (Email / Register / Generic)
         if sid.startswith("Arkose") or sid.endswith("ArkoseChallenge"):
+            # 再チャレンジ (_seen_subtasks > 0) はキャッシュ済みトークンを捨てて再解く
+            if self._seen_subtasks.get(sid, 0) > 0:
+                logger.info(f"Arkose 再チャレンジ ({sid} 回目={self._seen_subtasks[sid]}) — キャッシュトークン破棄して再解く")
+                self.arkose_token = None
             if self.arkose_token is None:
                 web_modal = subtask.get("web_modal", {})
                 blob = urllib.parse.parse_qs(
@@ -606,7 +612,12 @@ class XApiFlow:
             }
 
         if sid in ("UsernameEntryBio", "SignupUsername", "EnterUsername"):
-            uname = self.username or _gen_username()
+            # 衝突リトライ: 同じ subtask が 2 回目以降なら新しいユーザー名を生成
+            if self._seen_subtasks.get(sid, 0) > 0:
+                logger.info(f"ユーザー名衝突 ({sid} 回目={self._seen_subtasks[sid]}) — 別のユーザー名を生成")
+                uname = _gen_username()
+            else:
+                uname = self.username or _gen_username()
             self.username = uname
             return {
                 "subtask_id": sid,
@@ -683,6 +694,14 @@ class XApiFlow:
 
         for i in range(max_iterations):
             subtasks = data.get("subtasks", [])
+
+            # X は HTTP 200 でエラーを返すことがある
+            if data.get("errors"):
+                errs = data["errors"]
+                logger.error(f"iter={i}: X API エラー body: {errs}")
+                # 327=ユーザー名重複など一部は回復可能だが、ここでは即失敗
+                return False
+
             if not subtasks:
                 logger.debug(f"iter={i}: subtasks 空 → 完了判定")
                 break
@@ -703,16 +722,27 @@ class XApiFlow:
                     logger.error("メール確認コード取得失敗")
                     return False
 
-            # 全 subtask に対して input を組み立てる
+            # 全 subtask に対して input を組み立てる (_seen_subtasks は読み取りのみ、更新は後)
             subtask_inputs = []
+            skipped_ids = []
             for st in subtasks:
                 inp = self._build_subtask_input(st, code)
                 if inp:
                     subtask_inputs.append(inp)
+                else:
+                    skipped_ids.append(st.get("subtask_id"))
+
+            # 出現回数を更新 (次の再チャレンジ / 衝突検出のため)
+            for st in subtasks:
+                sid = st.get("subtask_id", "")
+                if sid:
+                    self._seen_subtasks[sid] = self._seen_subtasks.get(sid, 0) + 1
 
             if not subtask_inputs:
-                logger.warning(f"iter={i}: 処理可能な subtask なし — subtasks={[s.get('subtask_id') for s in subtasks]}")
-                break
+                logger.error(f"iter={i}: 処理可能な subtask が 1 件もなし (全スキップ) — subtasks={[s.get('subtask_id') for s in subtasks]}")
+                return False
+            if skipped_ids:
+                logger.debug(f"iter={i}: 未知 subtask スキップ: {skipped_ids}")
 
             # password 送信後は ct0 を取り込む
             data = self._post(X_TASK_URL, json={
