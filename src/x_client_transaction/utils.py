@@ -32,15 +32,13 @@ def float_to_hex(x):
     fraction = x - quotient
 
     while quotient > 0:
-        quotient = int(x / 16)
-        remainder = int(x - (float(quotient) * 16))
+        remainder = quotient % 16
+        quotient = quotient // 16
 
         if remainder > 9:
             result.insert(0, chr(remainder + 55))
         else:
             result.insert(0, str(remainder))
-
-        x = float(quotient)
 
     if fraction == 0:
         return ''.join(result)

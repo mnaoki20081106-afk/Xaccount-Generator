@@ -176,8 +176,13 @@ class BrowserManager:
 
         cores = device["hardwareConcurrency"] if device else random.choice([4, 6, 8, 12, 16])
         memory = device["deviceMemory"] if device else random.choice([4, 8, 8, 16])
-        rtt = random.randint(20, 120)
-        downlink = round(random.uniform(1.5, 10.0), 1)
+        # Use device values so BDA payload and browser JS environment stay consistent
+        rtt = device["rtt"] if device else random.randint(20, 120)
+        downlink = device["downlink"] if device else round(random.uniform(1.5, 10.0), 1)
+        iw = device["innerWidth"] if device else vp_w
+        ih = device["innerHeight"] if device else vp_h
+        ow = device["outerWidth"] if device else vp_w
+        oh = device["outerHeight"] if device else vp_h
         # ランダムなキャンバスノイズシード（毎コンテキストで異なる）
         canvas_noise = random.randint(1, 9999)
 
@@ -289,10 +294,10 @@ class BrowserManager:
 
                 // screen 系
                 try {{
-                    Object.defineProperty(window, 'outerWidth', {{ get: () => {vp_w} }});
-                    Object.defineProperty(window, 'outerHeight', {{ get: () => {vp_h} }});
-                    Object.defineProperty(window, 'innerWidth', {{ get: () => {vp_w} }});
-                    Object.defineProperty(window, 'innerHeight', {{ get: () => {vp_h} }});
+                    Object.defineProperty(window, 'outerWidth', {{ get: () => {ow} }});
+                    Object.defineProperty(window, 'outerHeight', {{ get: () => {oh} }});
+                    Object.defineProperty(window, 'innerWidth', {{ get: () => {iw} }});
+                    Object.defineProperty(window, 'innerHeight', {{ get: () => {ih} }});
                 }} catch(e) {{}}
 
                 // 自動化チェック関数を潰す
