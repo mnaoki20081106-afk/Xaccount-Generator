@@ -5,6 +5,8 @@ import random
 _HERE = os.path.dirname(__file__)
 _POOL = None
 
+CHROME_COLOR_DEPTH = 24
+
 
 def _pool():
     global _POOL
@@ -83,10 +85,13 @@ def generate_device():
     memory = _pick(p["memory"])["value"]
     net = _pick(p["network"])
     win = _window_on(p["base"], screen)
+    color_depth = win["screen"].get("colorDepth", CHROME_COLOR_DEPTH)
     return {
         **win,
+        "color_depth": color_depth,
         "hardwareConcurrency": cores,
         "deviceMemory": memory,
+        "device_memory": memory,
         "jsHeapSizeLimit": js_heap_size_limit(memory),
         "connection": {
             "effectiveType": "4g",
@@ -94,8 +99,8 @@ def generate_device():
             "rtt": net["rtt"],
             "saveData": net["saveData"],
         },
-        "glVendor": gpu["vendor"],
-        "glRenderer": gpu["renderer"],
+        "glVendor": gpu.get("glVendor") or gpu.get("vendor", ""),
+        "glRenderer": gpu.get("glRenderer") or gpu.get("renderer", ""),
     }
 
 
