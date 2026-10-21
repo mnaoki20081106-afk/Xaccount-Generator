@@ -132,6 +132,10 @@ class FiveSimClient:
             except Exception:
                 pass
 
+    async def cancel(self, order_id: str):
+        """SmsManager / account_factory から共通名で呼ぶための公開エイリアス。"""
+        await self._cancel_order(order_id)
+
     async def get_balance(self) -> float:
         async with httpx.AsyncClient(timeout=10) as client:
             try:

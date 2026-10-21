@@ -115,6 +115,10 @@ class SmsActivateClient:
         except Exception:
             pass
 
+    async def cancel(self, activation_id: str):
+        """SmsManager / account_factory から共通名で呼ぶための公開エイリアス。"""
+        await self._cancel(activation_id)
+
     async def _cancel(self, activation_id: str):
         params = {
             "api_key": self.api_key,

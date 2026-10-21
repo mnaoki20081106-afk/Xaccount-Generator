@@ -108,6 +108,35 @@ class MailTmClient:
         logger.warning(f"[mail.tm] timeout waiting for code ({timeout}s)")
         return None
 
+    async def get_latest_code(self, subject_keyword: str = "") -> Optional[str]:
+        """
+        一度だけ受信箱を見て6桁コードを探す（ポーリングはしない）。
+        OutlookClient.get_latest_code() と同じインターフェースにして、
+        api_flow.py の _fetch_code() がどちらのメールプロバイダでも
+        動くようにする（Outlook 失敗時に mail.tm へフォールバックする構成で必須）。
+        """
+        if not self._token:
+            return None
+        headers = {"Authorization": f"Bearer {self._token}"}
+        try:
+            r = await self._client.get(f"{BASE_URL}/messages", headers=headers)
+            if r.status_code != 200:
+                return None
+            messages = r.json().get("hydra:member", [])
+            for msg in messages:
+                subj = msg.get("subject", "")
+                if subject_keyword and subject_keyword.lower() not in subj.lower():
+                    continue
+                msg_id = msg.get("id")
+                full = await self._get_message(msg_id, headers)
+                if full:
+                    code = self._extract_code(full)
+                    if code:
+                        return code
+        except Exception as e:
+            logger.debug(f"[mail.tm] get_latest_code error: {e}")
+        return None
+
     async def _get_message(self, msg_id: str, headers: dict) -> Optional[str]:
         try:
             r = await self._client.get(f"{BASE_URL}/messages/{msg_id}", headers=headers)

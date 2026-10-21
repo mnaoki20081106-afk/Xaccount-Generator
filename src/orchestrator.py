@@ -4,6 +4,7 @@
 """
 import asyncio
 import random
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 from loguru import logger
@@ -22,6 +23,29 @@ from .actions.follow import FollowAction
 from .actions.like import LikeAction
 from .warmup import WarmupScheduler
 from .detector import ShadowbanDetector, ShadowbanResolver
+
+
+class _RateLimiter:
+    """
+    1時間あたり per_hour 回までという全体レートを concurrency に関係なく守る。
+    sem 配下で各タスクが個別に sleep するだけだと、concurrency 個が同時に
+    スリープ→同時に実行してしまい per_hour が無意味化するため、
+    ロックで「次に実行してよい時刻」を直列に予約してからスリープする。
+    """
+
+    def __init__(self, per_hour: float):
+        self._interval = 3600.0 / max(per_hour, 0.001)
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_at)
+            self._next_at = start + self._interval
+            delay = start - now
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 class Orchestrator:
@@ -89,11 +113,14 @@ class Orchestrator:
 
         logger.info(f"Generating {need} accounts (concurrency={concurrency})")
         sem = asyncio.Semaphore(concurrency)
+        limiter = _RateLimiter(self.config.factory.max_per_hour)
 
         async def _create_one():
+            # レート制限はまず全体で直列に予約 (concurrency に関係なく守られる)。
+            # sem の取得はその後 — 複数タスクが同時に実行枠に入ることはあるが、
+            # 「開始時刻」自体は max_per_hour に従って均等分散される。
+            await limiter.wait()
             async with sem:
-                # レート制限: 1時間に max_per_hour 垢まで
-                await asyncio.sleep(random.uniform(60 / self.config.factory.max_per_hour, 120))
                 account = await self.factory.create_one()
                 if account:
                     aid = await self.db.add_account(account)

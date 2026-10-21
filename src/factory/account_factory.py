@@ -27,6 +27,9 @@ from ..utils.profile import setup_profile
 from ..email_provider.mailtm import MailTmClient
 from .api_flow import XApiFlow, HAS_CURL
 
+if HAS_CURL:
+    from curl_cffi import requests as curl_requests
+
 # X サインアップで出る FunCaptcha の public key（動的抽出できなかった場合のフォールバック）
 # api_flow.py の X_ARKOSE_KEY と一致させること
 X_FUNCAPTCHA_KEY_FALLBACK = "2CB16598-CB82-4CF7-B332-5990DB66F3AB"
@@ -202,8 +205,11 @@ class AccountFactory:
             logger.warning(f"[{username}] API フロー失敗 — Playwright にフォールバック")
         # ────────────────────────────────────────────────────────────────
 
-        # SMS は電話ステップ到達時に取得（無駄打ち防止）
-        activation_id = phone_number = sms_client_used = None
+        # SMS は電話ステップ到達時に取得（無駄打ち防止）。
+        # sms_state はこの呼び出し専用のローカル dict —
+        # インスタンス属性にすると concurrency>1 の並行生成で他アカウントの
+        # SMS 情報を上書きする競合バグになるため、必ず呼び出し単位で渡す。
+        sms_state: dict = {"activation_id": None, "client": None, "phone": None}
 
         context = None
         try:
@@ -222,28 +228,25 @@ class AccountFactory:
             final_username, success = await self._run_signup_flow(
                 page, username, password, email, display_name,
                 mail_client=mail_client,
-                phone_number=phone_number,
-                activation_id=activation_id,
-                sms_client_used=sms_client_used,
+                sms_state=sms_state,
                 proxy_url=proxy.url,
             )
 
             if not success:
-                pending = getattr(self, "_pending_sms", None)
-                if pending:
-                    aid, client = pending
-                    try:
-                        await client._cancel(aid)
-                    except Exception:
-                        pass
-                    self._pending_sms = None
+                await self._release_sms(sms_state)
                 return None
 
             username = final_username  # 衝突リトライで変更された場合に反映
+            phone_number = sms_state.get("phone")
 
             cookie_path = str(Path("data/cookies") / f"{username}.json")
             await self.browser.save_cookies(context, cookie_path)
             auth_token, ct0 = await self._extract_auth_tokens(context)
+
+            if not await self._verify_alive(auth_token, ct0, proxy.url):
+                logger.error(f"[{username}] auth_token はあるが即時凍結/無効 — 失敗扱い")
+                await self._release_sms(sms_state)
+                return None
 
             if self.config.factory.setup_profile:
                 profile_page = await self.browser.new_page(context, block_resources=False)
@@ -277,6 +280,7 @@ class AccountFactory:
 
         except Exception as e:
             logger.exception(f"[{username}] create failed: {e}")
+            await self._release_sms(sms_state)
             return None
         finally:
             if context:
@@ -296,15 +300,15 @@ class AccountFactory:
         email: str,
         display_name: str,
         mail_client=None,
-        phone_number: str | None = None,
-        activation_id: str | None = None,
-        sms_client_used=None,
+        sms_state: dict | None = None,
         proxy_url: str | None = None,
     ) -> tuple[str, bool]:
         """
         returns (final_username, success)
         username は衝突リトライで変わることがある
         """
+        if sms_state is None:
+            sms_state = {"activation_id": None, "client": None, "phone": None}
         try:
             await page.goto(
                 "https://x.com/i/flow/signup",
@@ -374,13 +378,13 @@ class AccountFactory:
                     elif step == "email":
                         await self._handle_email(page, email)
                     elif step == "phone":
-                        await self._handle_phone(page, phone_number, username)
+                        await self._handle_phone(page, sms_state, username)
                     elif step == "birthday":
                         await self._handle_birthday(page, username)
                     elif step == "code":
                         ok = await self._handle_code(
                             page, username, mail_client,
-                            activation_id, sms_client_used
+                            sms_state.get("activation_id"), sms_state.get("client"),
                         )
                         if not ok:
                             return username, False
@@ -436,11 +440,27 @@ class AccountFactory:
         await self._click_next(page)
         await _human(1.0, 2.0)
 
-    async def _handle_phone(self, page, phone_number: str | None, username: str):
+    async def _handle_phone(self, page, sms_state: dict, username: str):
+        """
+        電話番号ステップに到達した時点で初めて SMS 番号を購入する（無駄打ち防止）。
+        以前のバージョンは phone_number が常に None で渡されており、
+        use_phone=true でも電話認証が一度も実行されていなかった。
+        """
+        phone_number = sms_state.get("phone")
+
+        if not phone_number and self._sms_mgr and self._sms_mgr.enabled:
+            activation_id, phone_number, client = await self._sms_mgr.get_number()
+            if phone_number:
+                sms_state["activation_id"] = activation_id
+                sms_state["client"] = client
+                sms_state["phone"] = phone_number
+                logger.info(f"[{username}] SMS番号取得 +{phone_number}")
+
         if not phone_number:
             logger.warning(f"[{username}] phone step but no number — trying email switch")
             await self._try_switch_to_email(page)
             return
+
         logger.debug(f"STEP phone → +{phone_number}")
         loc = page.locator('input[name="phone_number"], input[type="tel"]').first
         phone = phone_number if phone_number.startswith("+") else f"+{phone_number}"
@@ -599,7 +619,11 @@ class AccountFactory:
         code = None
 
         if mail_client:
-            code = await mail_client.wait_for_code(subject_keyword="Twitter", timeout=150)
+            # X は "Twitter" ブランドを廃止済みで確認メールの件名も変わっているため、
+            # 件名フィルタを固定文字列にすると一致せずコード取得が失敗しやすい。
+            # 新規作成した使い捨てアドレスには他のメールが来ないので、
+            # 件名フィルタなしで本文中の6桁コードを直接探す方が安全。
+            code = await mail_client.wait_for_code(subject_keyword="", timeout=150)
         elif activation_id and sms_client_used:
             code = await sms_client_used.wait_for_sms(activation_id, timeout_s=150)
 
@@ -745,6 +769,17 @@ class AccountFactory:
         logger.warning(f"email provider '{provider}' 未実装 — mail.tm にフォールバック")
         return await _try_mailtm()
 
+    async def _release_sms(self, sms_state: dict):
+        """サインアップ失敗時に SMS 番号を解放（残高消費を止める）。"""
+        client = sms_state.get("client")
+        aid = sms_state.get("activation_id")
+        if client and aid:
+            try:
+                await client.cancel(aid)
+                logger.debug(f"SMS番号解放 id={aid}")
+            except Exception as e:
+                logger.debug(f"SMS番号解放失敗 id={aid}: {e}")
+
     async def _extract_auth_tokens(self, context) -> tuple[str | None, str | None]:
         try:
             cookies = await context.cookies()
@@ -753,3 +788,34 @@ class AccountFactory:
             return auth_token, ct0
         except Exception:
             return None, None
+
+    async def _verify_alive(
+        self, auth_token: str | None, ct0: str | None, proxy_url: str | None
+    ) -> bool:
+        """
+        auth_token の cookie が立っているだけでは「作成直後に即凍結」を
+        見逃す。verify_credentials.json を一度叩いて実際に生存しているか確認する。
+        """
+        if not auth_token or not HAS_CURL:
+            return bool(auth_token)
+        try:
+            session = curl_requests.Session(impersonate="chrome136")
+            session.cookies.set("auth_token", auth_token, domain=".x.com")
+            if ct0:
+                session.cookies.set("ct0", ct0, domain=".x.com")
+                session.headers.update({"x-csrf-token": ct0})
+            if proxy_url:
+                session.proxies.update({"all": proxy_url})
+            r = session.get(
+                "https://api.x.com/1.1/account/verify_credentials.json",
+                params={"include_entities": "false", "skip_status": "true"},
+                timeout=20,
+            )
+            if r.status_code != 200:
+                logger.warning(f"verify_credentials HTTP {r.status_code}")
+                return False
+            return not bool(r.json().get("suspended"))
+        except Exception as e:
+            logger.warning(f"verify_credentials error: {e}")
+            # 確認自体が失敗した場合は判定不能 — auth_token の有無だけで判断
+            return bool(auth_token)

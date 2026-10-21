@@ -212,8 +212,10 @@ class ProxyManager:
 
     async def health_check(self, session: ProxySession) -> bool:
         try:
+            # httpx>=0.28 で proxies= は削除され proxy= (単数) のみ。
+            # これを直さないと最新 httpx 環境で全プロキシが unhealthy 判定になる。
             async with httpx.AsyncClient(
-                proxies=session.url, timeout=15.0, follow_redirects=True
+                proxy=session.url, timeout=15.0, follow_redirects=True
             ) as client:
                 r = await client.get("https://api.ipify.org?format=json")
                 if r.status_code == 200:

@@ -751,10 +751,37 @@ class XApiFlow:
         if not self.auth_token:
             logger.error("auth_token が cookie に出ていない (サインアップ失敗)")
             return False
+
+        # auth_token が立っただけでは「作成直後に即凍結」を見逃す。
+        # verify_credentials で実際にログイン状態として読めるか確認する。
+        if not self._verify_alive():
+            logger.error(f"@{self.username} auth_token はあるが即時凍結/無効 — 失敗扱い")
+            return False
+
         logger.info(
             f"API サインアップ完了 @{self.username} auth_token={self.auth_token[:8]}..."
         )
         return True
+
+    def _verify_alive(self) -> bool:
+        """verify_credentials.json で垢が実際に生きているか確認する生存チェック。"""
+        try:
+            r = self._session.get(
+                "https://api.x.com/1.1/account/verify_credentials.json",
+                params={"include_entities": "false", "skip_status": "true"},
+            )
+            if r.status_code != 200:
+                logger.warning(f"verify_credentials HTTP {r.status_code}: {r.text[:200]}")
+                return False
+            data = r.json()
+            suspended = bool(data.get("suspended"))
+            if suspended:
+                logger.warning(f"@{self.username} suspended=true")
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"verify_credentials error: {e}")
+            return False
 
     def run(self, email_code_fetcher) -> bool:
         """

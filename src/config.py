@@ -26,7 +26,7 @@ class SmsConfig(BaseModel):
     provider: str = "5sim"               # 5sim / smsactivate / auto / none
     api_key: str = ""                    # 5sim または primary プロバイダーのキー
     api_key2: str = ""                   # auto モード時の secondary (smsactivate)
-    preferred_countries: list[str] = ["russia", "india", "indonesia", "philippines"]
+    preferred_countries: list[str] = ["usa", "england", "germany", "france", "netherlands"]
 
 
 class CaptchaConfig(BaseModel):

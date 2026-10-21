@@ -176,7 +176,7 @@ class OutlookClient:
 
     async def wait_for_code(
         self,
-        subject_keyword: str = "Twitter",
+        subject_keyword: str = "",
         timeout: int = 150,
         poll_interval: int = 5,
     ) -> str | None:
@@ -189,7 +189,7 @@ class OutlookClient:
         logger.warning(f"[Outlook] {subject_keyword} コードタイムアウト ({timeout}s)")
         return None
 
-    async def get_latest_code(self, subject_keyword: str = "Twitter") -> str | None:
+    async def get_latest_code(self, subject_keyword: str = "") -> str | None:
         token = await self._ensure_access_token()
         if not token:
             logger.debug("[Outlook] access_token なし — コード取得スキップ")

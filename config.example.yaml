@@ -30,11 +30,14 @@ sms:
   api_key: "YOUR_5SIM_KEY"
   # auto モード時の smsactivate バックアップ (省略可)
   api_key2: ""
-  preferred_countries:         # 安い国から。届かない場合は即キャンセル
-    - "russia"
-    - "india"
-    - "indonesia"
-    - "philippines"
+  # russia/india 等の激安国は X 側で弾かれやすく即BANの主因になるため非推奨。
+  # 西側の国を優先し、コストより生存率を取る。
+  preferred_countries:
+    - "usa"
+    - "england"
+    - "germany"
+    - "france"
+    - "netherlands"
 
 captcha:
   # Playwright フォールバック時のソルバー:
