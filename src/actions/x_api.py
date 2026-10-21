@@ -42,6 +42,13 @@ _BASE = "https://x.com/i/api"
 # curl_cffi の Chrome バージョン（api_flow.py と揃える）
 _IMPERSONATE = "chrome136"
 
+# twikit と同一 UA（macOS Safari）— X 側のボット検出回避
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.5 Safari/605.1.15"
+)
+
 
 # ── Typed exceptions ────────────────────────────────────────────────────────
 
@@ -120,6 +127,7 @@ def _base_headers(ct0: str, transaction_id: Optional[str] = None) -> dict:
         "x-twitter-active-user": "yes",
         "x-twitter-auth-type": "OAuth2Session",
         "x-twitter-client-language": "ja",
+        "User-Agent": _USER_AGENT,
         "Accept": "*/*",
         "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
         "Referer": "https://x.com/",
@@ -155,7 +163,7 @@ async def _get_transaction(session, ct0: str, proxy_key: str) -> Optional[Client
                 "Authorization": f"Bearer {_BEARER}",
                 "x-csrf-token": ct0,
                 "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": _USER_AGENT,
             }
             await ct.init(session, headers)
             _transaction_cache[proxy_key] = ct
