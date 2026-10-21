@@ -164,6 +164,14 @@ class XApiFlow:
 
     def _post(self, url: str, **kwargs) -> dict:
         r = self._session.post(url, **kwargs)
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            body.setdefault("_raw_status", r.status_code)
+            body.setdefault("_raw_text", r.text[:200])
+            return body
         try:
             return r.json()
         except Exception:
@@ -224,7 +232,7 @@ class XApiFlow:
             "site_referer": "https://iframe.arkoselabs.com/",
         }
         try:
-            resp = curl_requests.post(f"{base_url}/createTask", json=payload).json()
+            resp = curl_requests.post(f"{base_url}/createTask", json=payload, timeout=30).json()
         except Exception as e:
             logger.error(f"CDS createTask error: {e}")
             return None
@@ -241,6 +249,7 @@ class XApiFlow:
                 resp = curl_requests.post(
                     f"{base_url}/getTask",
                     json={"api_key": self.cds_api_key, "task_id": task_id},
+                    timeout=15,
                 ).json()
                 status = resp.get("status")
                 if status == "processing":

@@ -34,11 +34,10 @@ def float_to_hex(x):
     while quotient > 0:
         remainder = quotient % 16
         quotient = quotient // 16
+        result.insert(0, format(remainder, 'x'))
 
-        if remainder > 9:
-            result.insert(0, chr(remainder + 55))
-        else:
-            result.insert(0, str(remainder))
+    if not result:
+        result.append('0')
 
     if fraction == 0:
         return ''.join(result)
@@ -49,11 +48,7 @@ def float_to_hex(x):
         fraction *= 16
         integer = int(fraction)
         fraction -= float(integer)
-
-        if integer > 9:
-            result.append(chr(integer + 55))
-        else:
-            result.append(str(integer))
+        result.append(format(integer, 'x'))
 
     return ''.join(result)
 

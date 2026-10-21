@@ -7,7 +7,7 @@ proxy:
   port: 12321
   username: "YOUR_PROXY_USER"
   password: "YOUR_PROXY_PASS"
-  country: "jp"                # 日本IP固定
+  country: ""                  # "" = 混合IP（最安）。"jp" で日本IP固定
   sticky_ttl_minutes: 30
   max_accounts_per_ip: 3       # 同一IPに割り当てる最大垢数（少なめ推奨）
 
