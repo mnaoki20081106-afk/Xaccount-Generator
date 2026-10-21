@@ -800,18 +800,21 @@ class AccountFactory:
         if not auth_token or not HAS_CURL:
             return bool(auth_token)
         try:
-            session = curl_requests.Session(impersonate="chrome136")
-            session.cookies.set("auth_token", auth_token, domain=".x.com")
-            if ct0:
-                session.cookies.set("ct0", ct0, domain=".x.com")
-                session.headers.update({"x-csrf-token": ct0})
+            kwargs: dict = {"impersonate": "chrome136", "timeout": 20}
             if proxy_url:
-                session.proxies.update({"all": proxy_url})
-            r = session.get(
-                "https://api.x.com/1.1/account/verify_credentials.json",
-                params={"include_entities": "false", "skip_status": "true"},
-                timeout=20,
-            )
+                kwargs["proxies"] = {"https": proxy_url, "http": proxy_url}
+            cookies = {"auth_token": auth_token}
+            headers = {}
+            if ct0:
+                cookies["ct0"] = ct0
+                headers["x-csrf-token"] = ct0
+            async with curl_requests.AsyncSession(**kwargs) as session:
+                r = await session.get(
+                    "https://api.x.com/1.1/account/verify_credentials.json",
+                    params={"include_entities": "false", "skip_status": "true"},
+                    cookies=cookies,
+                    headers=headers,
+                )
             if r.status_code != 200:
                 logger.warning(f"verify_credentials HTTP {r.status_code}")
                 return False
