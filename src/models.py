@@ -22,6 +22,8 @@ class Account(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     twofa_secret: Optional[str] = None  # encrypted
+    auth_token: Optional[str] = None    # X session cookie
+    ct0: Optional[str] = None           # X CSRF token
     status: AccountStatus = AccountStatus.CREATED
     shadow_score: float = 0.0
     proxy_id: Optional[str] = None
