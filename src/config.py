@@ -11,7 +11,7 @@ class ProxyConfig(BaseModel):
     port: int
     username: str
     password: str
-    country: str = "jp"
+    country: str = ""                # 空文字 = 混合IP（国指定なし、最安）。"jp" で日本IP固定
     sticky_ttl_minutes: int = 30
     max_accounts_per_ip: int = 5
 

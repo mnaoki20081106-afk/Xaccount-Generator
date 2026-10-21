@@ -152,7 +152,7 @@ class XApiFlow:
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
             "x-twitter-active-user": "yes",
-            "x-twitter-client-language": "en",
+            "x-twitter-client-language": "ja",
         })
         if proxy_url:
             self._session.proxies.update({"all": proxy_url})

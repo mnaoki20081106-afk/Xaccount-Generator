@@ -103,7 +103,9 @@ class ProxySession:
     @property
     def url(self) -> str:
         c = self._config
-        user = f"{c.username}-session-{self.session_id}-country-{c.country}"
+        user = f"{c.username}-session-{self.session_id}"
+        if c.country:
+            user += f"-country-{c.country}"
         return f"http://{user}:{c.password}@{c.host}:{c.port}"
 
     def is_cooling(self) -> bool:
