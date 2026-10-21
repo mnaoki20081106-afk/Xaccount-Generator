@@ -121,6 +121,10 @@ def main():
     sub.add_parser("list", help="垢一覧を表示")
     sub.add_parser("status", help="垢一覧を表示（listの別名）")
 
+    p_serve = sub.add_parser("serve", help="HTTP API サーバーを起動")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", type=int, default=8080)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -146,6 +150,12 @@ def main():
         ))
     elif args.command in ("list", "status"):
         asyncio.run(cmd_list(config))
+    elif args.command == "serve":
+        import os
+        import uvicorn
+        os.environ.setdefault("GENERATOR_CONFIG", args.config)
+        from .api.server import app
+        uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
