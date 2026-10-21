@@ -28,7 +28,8 @@ from ..email_provider.mailtm import MailTmClient
 from .api_flow import XApiFlow, HAS_CURL
 
 # X サインアップで出る FunCaptcha の public key（動的抽出できなかった場合のフォールバック）
-X_FUNCAPTCHA_KEY_FALLBACK = "2F4F0B28-BC94-4271-8AD7-A51662E3C91C"
+# api_flow.py の X_ARKOSE_KEY と一致させること
+X_FUNCAPTCHA_KEY_FALLBACK = "2CB16598-CB82-4CF7-B332-5990DB66F3AB"
 
 # ステップ検出用セレクタ
 STEP_PROBES: dict[str, str] = {
@@ -62,7 +63,7 @@ ERROR_SELECTOR = '[data-testid="ocfEnterTextError"], [role="alert"]'
 
 
 def _gen_password(n: int = 14) -> str:
-    """X 要件準拠: 大小英数 + 記号を各1文字以上含む。"""
+    """X 要件準拠: 大小英数 + 記号を各04文字以上含む。"""
     symbols = "!@#$%^&*"
     pool = string.ascii_letters + string.digits + symbols
     while True:
@@ -110,16 +111,15 @@ class AccountFactory:
         self._init_clients()
 
     def _init_clients(self):
-        if self.config.captcha.provider == "capsolver" and self.config.captcha.api_key:
-            from ..utils.captcha import CapSolverClient
-            self._captcha_client = CapSolverClient(self.config.captcha.api_key)
+        from ..utils.captcha import get_captcha_client
+        self._captcha_client = get_captcha_client(self.config.captcha)
         if self.config.factory.use_phone:
             from ..sms.manager import SmsManager
             self._sms_mgr = SmsManager(self.config.sms)
 
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
     # API フロー (Playwright 不要)
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
 
     async def _create_via_api_flow(
         self,
@@ -171,9 +171,9 @@ class AccountFactory:
         )
         return account
 
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
     # 公開 API
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
 
     async def create_one(self) -> Account | None:
         username = _gen_username()
@@ -190,7 +190,7 @@ class AccountFactory:
             logger.warning(f"[{username}] proxy unhealthy, skip")
             return None
 
-        # ── API フロー (Playwright 不要、高速) ──────────────────────────────
+        # ── API フロー (Playwright 不要、高速) ────────────────────────────────
         if HAS_CURL and not self.config.factory.use_phone:
             api_account = await self._create_via_api_flow(
                 email, display_name, mail_client, proxy
@@ -200,7 +200,7 @@ class AccountFactory:
                     await mail_client.close()
                 return api_account
             logger.warning(f"[{username}] API フロー失敗 — Playwright にフォールバック")
-        # ────────────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────────────
 
         # SMS 番号を事前取得
         activation_id = phone_number = sms_client_used = None
@@ -209,7 +209,13 @@ class AccountFactory:
 
         context = None
         try:
-            context = await self.browser.new_context(proxy_url=proxy.url)
+            # デバイスフィンガープリントをコンテキストに注入して一貫性を保つ
+            try:
+                from ..arkose_solver.devices import generate_device
+                device = generate_device()
+            except Exception:
+                device = None
+            context = await self.browser.new_context(proxy_url=proxy.url, device=device)
             page = await self.browser.new_page(context, block_resources=True)
 
             # dialog (通知許可など) を自動 dismiss
@@ -274,9 +280,9 @@ class AccountFactory:
             if mail_client:
                 await mail_client.close()
 
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
     # ステートマシン本体
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
 
     async def _run_signup_flow(
         self,
@@ -406,9 +412,9 @@ class AccountFactory:
             logger.error(f"[{username}] signup flow error: {e}")
             return username, False
 
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
     # ステップハンドラ群
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
 
     async def _handle_name(self, page, display_name: str):
         logger.debug(f"STEP name → {display_name}")
@@ -639,9 +645,9 @@ class AccountFactory:
             break
         return username
 
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
     # 共通ヘルパー
-    # ──────────────────────────────────────────
+    # ────────────────────────────────────────────
 
     async def _detect_step(self, page) -> str:
         for step, sel in STEP_PROBES.items():
