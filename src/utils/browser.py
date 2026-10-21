@@ -1,21 +1,49 @@
 """
-Playwright + stealth によるブラウザ起動と指紋隔離。
+Playwright + patchright によるブラウザ起動と指紋隔離。
 アカウントごとに独立したコンテキストを持つ。
 """
 from pathlib import Path
 from typing import Optional
 import hashlib
 import json
+import random
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+# patchright は Runtime.enable leak を修正した drop-in replacement。
+# 未インストールなら playwright にフォールバック。
+try:
+    from patchright.async_api import async_playwright, Browser, BrowserContext, Page
+    _USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+    _USING_PATCHRIGHT = False
+
 from loguru import logger
 
-# playwright-stealth は環境によってインポート方法が違う場合がある
-try:
-    from playwright_stealth import stealth_async
-except ImportError:
-    stealth_async = None
-    logger.warning("playwright-stealth が見つかりません。基本的な起動のみ行います。")
+# patchright は playwright-stealth を不要にするので、そちらは試みない。
+# patchright なしの場合のみ stealth を適用する。
+_stealth_async = None
+if not _USING_PATCHRIGHT:
+    try:
+        from playwright_stealth import stealth_async as _stealth_async
+    except ImportError:
+        pass
+
+# Chrome バージョン池（実使用分布に合わせた重み付き）
+_CHROME_VERSIONS = [
+    ("136", 18), ("135", 20), ("134", 16), ("133", 14),
+    ("131", 10), ("130", 9), ("128", 6), ("124", 4),
+    ("122", 2), ("120", 1),
+]
+_UA_VERSIONS, _UA_WEIGHTS = zip(*_CHROME_VERSIONS)
+
+
+def _pick_chrome_ua() -> str:
+    v = random.choices(_UA_VERSIONS, weights=_UA_WEIGHTS, k=1)[0]
+    return (
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{v}.0.0.0 Safari/537.36"
+    )
 
 
 class BrowserManager:
@@ -28,18 +56,24 @@ class BrowserManager:
 
     async def start(self):
         self._playwright = await async_playwright().start()
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--window-size=1280,720",
+        ]
+        # patchright はこれらを内部で処理するので手動追加しない。
+        # playwright fallback 時のみ明示的に追加。
+        if not _USING_PATCHRIGHT:
+            launch_args.append("--disable-blink-features=AutomationControlled")
+
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
             slow_mo=self.slow_mo,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1280,720",
-            ],
+            args=launch_args,
         )
-        logger.info("Browser launched")
+        mode = "patchright" if _USING_PATCHRIGHT else "playwright"
+        logger.info(f"Browser launched ({mode})")
 
     async def stop(self):
         if self._browser:
@@ -54,30 +88,35 @@ class BrowserManager:
         user_data_dir: Optional[str] = None,
         locale: str = "ja-JP",
         timezone_id: str = "Asia/Tokyo",
+        device: Optional[dict] = None,
     ) -> BrowserContext:
         """
         アカウント専用の隔離コンテキストを作成。
-        proxy_url 例: http://user:pass@host:port
+        device: arkose_solver.devices.generate_device() の戻り値。
+                渡すと hardwareConcurrency / deviceMemory / screen を一致させる。
         """
         if not self._browser:
             raise RuntimeError("Browser not started. Call start() first.")
 
-        context_options = {
+        ua = _pick_chrome_ua()
+
+        # device データからビューポートを決定
+        vp_w, vp_h = 1280, 720
+        if device:
+            sc = device.get("screen", {})
+            vp_w = min(sc.get("availWidth", 1280), sc.get("width", 1280))
+            vp_h = sc.get("availHeight", 720)
+
+        context_options: dict = {
             "locale": locale,
             "timezone_id": timezone_id,
-            "viewport": {"width": 1280, "height": 720},
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
+            "viewport": {"width": vp_w, "height": vp_h},
+            "user_agent": ua,
             "java_script_enabled": True,
             "ignore_https_errors": True,
         }
 
         if proxy_url:
-            # Playwright の proxy 形式に変換
-            # http://user:pass@host:port → server + username + password
             from urllib.parse import urlparse
             parsed = urlparse(proxy_url)
             context_options["proxy"] = {
@@ -91,39 +130,51 @@ class BrowserManager:
         context = await self._browser.new_context(**context_options)
         context.set_default_timeout(self.timeout)
 
-        # 追加の指紋対策スクリプト
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            """
-        )
+        # 指紋注入スクリプト
+        cores = device["hardwareConcurrency"] if device else random.choice([4, 8, 12, 16])
+        memory = device["deviceMemory"] if device else random.choice([4, 8, 16])
+        await context.add_init_script(f"""
+            (() => {{
+                // webdriver フラグ除去（patchright でも念のため）
+                Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+                // chrome オブジェクト
+                if (!window.chrome) window.chrome = {{ runtime: {{}} }};
+                // 言語
+                Object.defineProperty(navigator, 'languages', {{
+                    get: () => ['ja-JP', 'ja', 'en-US', 'en']
+                }});
+                // プラグイン（空でないことが重要）
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: () => {{ const a = [1,2,3,4,5]; a.item = i => a[i]; return a; }}
+                }});
+                // デバイス系: devices pool から一致させる
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{
+                    get: () => {cores}
+                }});
+                Object.defineProperty(navigator, 'deviceMemory', {{
+                    get: () => {memory}
+                }});
+            }})();
+        """)
 
         return context
 
     async def new_page(self, context: BrowserContext, block_resources: bool = True) -> Page:
         """
         block_resources=True でサインアップ時の帯域を最小化。
-        画像・動画・広告トラッキングを遮断。フォントは Captcha スコア対策で通す。
-        1垢あたりの通信量が ~1MB → プロキシコスト $0.001/垢 以下。
         """
         page = await context.new_page()
-        if stealth_async:
-            await stealth_async(page)
+        if _stealth_async:
+            await _stealth_async(page)
         if block_resources:
             await self._setup_resource_blocking(page)
         return page
 
     async def _setup_resource_blocking(self, page: Page):
-        """不要リソースを遮断して帯域節約。"""
-        # 遮断する拡張子 — フォント (.woff/.ttf) は Captcha スコア対策で通す
         BLOCKED_EXTENSIONS = (
             ".png", ".jpg", ".jpeg", ".gif", ".webp",
             ".mp4", ".webm", ".ogg", ".mp3",
         )
-        # 遮断するホスト (広告・解析)
         BLOCKED_HOSTS = (
             "google-analytics.com", "googletagmanager.com",
             "doubleclick.net", "googlesyndication.com",
@@ -131,7 +182,6 @@ class BrowserManager:
             "hotjar.com", "clarity.ms",
             "ads-twitter.com", "t.co/i/",
         )
-        # 通す必要があるリソースタイプ
         ALLOWED_TYPES = {"document", "script", "xhr", "fetch", "stylesheet", "websocket"}
 
         async def handle_route(route):
@@ -139,21 +189,17 @@ class BrowserManager:
             rt = req.resource_type
             url = req.url.lower()
 
-            # 必須リソースは通す
             if rt in ALLOWED_TYPES:
-                # ただし広告ホストはスクリプトでも遮断
                 if any(h in url for h in BLOCKED_HOSTS):
                     await route.abort()
                     return
                 await route.continue_()
                 return
 
-            # 拡張子チェック
             if any(url.split("?")[0].endswith(ext) for ext in BLOCKED_EXTENSIONS):
                 await route.abort()
                 return
 
-            # image / media タイプは遮断 (font は通す)
             if rt in ("image", "media", "other"):
                 await route.abort()
                 return
