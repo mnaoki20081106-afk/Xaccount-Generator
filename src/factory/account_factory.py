@@ -1,1 +1,1 @@
-$(cat /tmp/account_factory_final.py)
+PLACEHOLDER_FULL_CONTENT
