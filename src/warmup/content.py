@@ -1,22 +1,34 @@
 """
 ウォームアップ用日本語ツイートテンプレ。
-自然に見えるよう多様なトピックをカバー。
+アルゴリズムに嫌われないよう多様なトピック・文体・長さをカバー。
 """
+from __future__ import annotations
+
 import random
 from faker import Faker
 
 fake = Faker("ja_JP")
 
-# カテゴリ別テンプレ。{} はランダム埋め込み
+# ──────────────────────────────────────────────────────────────
+# カテゴリ別テンプレ
+# ──────────────────────────────────────────────────────────────
+
 _FOOD = [
-    "今日のランチは{food}にした。美味しかった☺️",
-    "{food}食べたい気分。どこかいい店ないかな",
+    "今日のランチは{food}にした。美味しかった",
+    "{food}食べたい気分。どこかいい店ないかな〜",
     "夜ごはん{food}作った。我ながらうまくできた",
     "{food}って最高だよね。定期的に食べたくなる",
     "コンビニで{snack}買ってきた。これ好きすぎる",
     "カフェで作業してたら{drink}飲みすぎた",
     "{food}のレシピ調べてたらお腹すいてきた",
     "久しぶりに{food}食べたらめちゃくちゃ美味しかった",
+    "{food}、ここ最近ずっと食べてる。好きすぎてやばい",
+    "{snack}片手に作業するの最高すぎる",
+    "{drink}がないと一日が始まらない",
+    "外食久しぶりに行ったら{food}がとんでもなく美味しかった",
+    "{food}自炊してみたけどお店の味には勝てないな",
+    "今日は{food}の気分じゃないな〜何食べよ",
+    "{food}って地域によって全然味が違うの面白い",
 ]
 
 _WEATHER = [
@@ -27,6 +39,11 @@ _WEATHER = [
     "朝起きたら快晴だった。いい一日になりそう",
     "今日は雲ひとつない青空。テンション上がる",
     "最近天気が読めないな。傘手放せない",
+    "こんないい天気に家にいるの勿体ないな",
+    "湿度高すぎて外出る気力が消えた",
+    "夕焼けがきれいすぎた。思わず写真撮った",
+    "朝の空気がひんやりしてて気持ちよかった",
+    "夏の匂いがして懐かしい気分になった",
 ]
 
 _DAILY = [
@@ -45,6 +62,15 @@ _DAILY = [
     "なんとなく部屋の掃除したらすっきりした",
     "今日初めて{thing}やってみた。意外と楽しい",
     "もう今年も残り少ないの早すぎる",
+    "仕事終わった後のあの開放感がたまらない",
+    "布団から出たくない朝ってあるよね",
+    "今日は珍しくスムーズに全部うまくいった",
+    "最近ルーティン崩れてきてる気がする。整えなきゃ",
+    "やりたいことリストが増えてく一方で消化できてない",
+    "気がついたら深夜になってた。どうしたんだろ",
+    "土日に充電して月曜に臨む、これが基本",
+    "なんもしない休日もたまには必要だよな",
+    "意外とひとりの時間が一番充実してたりする",
 ]
 
 _ENTERTAINMENT = [
@@ -55,6 +81,31 @@ _ENTERTAINMENT = [
     "{genre}好きな人と話したい",
     "久しぶりに映画館行きたいな",
     "{media}の続き楽しみすぎる",
+    "昔好きだった{media}また見返したら最高だった",
+    "{genre}の名作って何年経っても色褪せないよな",
+    "{media}おすすめあったらコメントで教えてください",
+    "今夜は{media}三昧にする。もう決めた",
+    "{media}、最初は微妙かと思ったら後半がとんでもなかった",
+]
+
+_OPINION = [
+    "何でも継続するのって本当に難しいよね",
+    "やる気は待ってても来ない、とりあえず始めるしかない",
+    "人と比べるのやめたら少し楽になった",
+    "完璧じゃなくていい、続けることのほうが大事",
+    "時間は有限なんだよなって最近よく思う",
+    "断捨離したら頭が整理された気がした",
+    "朝型と夜型って本当に向き不向きあると思う",
+    "好きなことに時間を使うって大切だよな",
+    "何かを始めるのに遅すぎることはないと思ってる",
+]
+
+_QUESTION = [
+    "{media}好きな人いますか？おすすめ教えてほしいです",
+    "みんなの{thing}のモチベ管理どうしてる？",
+    "最近気になってること教えてほしいです",
+    "{genre}系でおすすめありますか？",
+    "週末の過ごし方どうしてるか気になる",
 ]
 
 _SHORT = [
@@ -68,52 +119,90 @@ _SHORT = [
     "のんびり",
     "まったり",
     "よし",
+    "ふと思った",
+    "なんかいい日だった",
+    "あー",
+    "すき",
+    "ちょっと休憩",
+    "集中できてる",
+    "ぼーっとしてた",
+    "じわじわくる",
 ]
 
+# ──────────────────────────────────────────────────────────────
 # 埋め込みワード
-_FOODS = ["ラーメン", "カレー", "うどん", "寿司", "焼肉", "パスタ", "そば", "天ぷら", "餃子", "ハンバーグ"]
-_SNACKS = ["チョコレート", "ポテチ", "アイス", "グミ", "プリン", "クッキー"]
-_DRINKS = ["コーヒー", "緑茶", "カフェラテ", "紅茶", "ほうじ茶"]
-_MEDIA = ["アニメ", "漫画", "ドラマ", "映画", "ゲーム", "小説", "YouTube"]
-_GENRES = ["SF", "ファンタジー", "ミステリー", "ホラー", "ラブコメ", "アクション"]
-_THINGS = ["筋トレ", "料理", "読書", "ヨガ", "ランニング", "瞑想"]
+# ──────────────────────────────────────────────────────────────
+
+_FOODS = [
+    "ラーメン", "カレー", "うどん", "寿司", "焼肉", "パスタ",
+    "そば", "天ぷら", "餃子", "ハンバーグ", "牛丼", "親子丼",
+    "たこ焼き", "お好み焼き", "焼き鳥", "定食", "チャーハン",
+]
+_SNACKS = [
+    "チョコレート", "ポテチ", "アイス", "グミ", "プリン",
+    "クッキー", "おにぎり", "肉まん", "シュークリーム",
+]
+_DRINKS = [
+    "コーヒー", "緑茶", "カフェラテ", "紅茶", "ほうじ茶",
+    "ミルクティー", "炭酸水", "エナドリ",
+]
+_MEDIA = [
+    "アニメ", "漫画", "ドラマ", "映画", "ゲーム",
+    "小説", "YouTube", "ポッドキャスト", "音楽",
+]
+_GENRES = [
+    "SF", "ファンタジー", "ミステリー", "ホラー",
+    "ラブコメ", "アクション", "サスペンス", "歴史",
+]
+_THINGS = [
+    "筋トレ", "料理", "読書", "ヨガ", "ランニング",
+    "瞑想", "日記", "スケッチ", "語学学習",
+]
+
+# ──────────────────────────────────────────────────────────────
+# 生成関数
+# ──────────────────────────────────────────────────────────────
+
+_CATEGORIES = ["food", "weather", "daily", "entertainment", "opinion", "question", "short"]
+_WEIGHTS     = [22,     12,       30,      15,               10,       6,         5]
+
+
+def _fill(tmpl: str) -> str:
+    return tmpl.format(
+        food=random.choice(_FOODS),
+        snack=random.choice(_SNACKS),
+        drink=random.choice(_DRINKS),
+        media=random.choice(_MEDIA),
+        genre=random.choice(_GENRES),
+        thing=random.choice(_THINGS),
+    )
 
 
 def random_tweet() -> str:
-    """ランダムな日本語ツイートを生成。"""
-    category = random.choices(
-        ["food", "weather", "daily", "entertainment", "short"],
-        weights=[25, 15, 35, 15, 10],
-    )[0]
+    category = random.choices(_CATEGORIES, weights=_WEIGHTS, k=1)[0]
 
     if category == "food":
-        tmpl = random.choice(_FOOD)
-        return tmpl.format(
-            food=random.choice(_FOODS),
-            snack=random.choice(_SNACKS),
-            drink=random.choice(_DRINKS),
-        )
+        return _fill(random.choice(_FOOD))
     elif category == "weather":
         return random.choice(_WEATHER)
     elif category == "daily":
-        tmpl = random.choice(_DAILY)
-        return tmpl.format(
-            media=random.choice(_MEDIA),
-            thing=random.choice(_THINGS),
-        )
+        return _fill(random.choice(_DAILY))
     elif category == "entertainment":
-        tmpl = random.choice(_ENTERTAINMENT)
-        return tmpl.format(
-            media=random.choice(_MEDIA),
-            genre=random.choice(_GENRES),
-        )
+        return _fill(random.choice(_ENTERTAINMENT))
+    elif category == "opinion":
+        return random.choice(_OPINION)
+    elif category == "question":
+        return _fill(random.choice(_QUESTION))
     else:
         return random.choice(_SHORT)
 
 
 def random_tweet_batch(n: int = 3) -> list[str]:
     """n本のツイートを重複なしで生成。"""
-    tweets = set()
-    while len(tweets) < n:
+    tweets: set[str] = set()
+    max_attempts = n * 20
+    attempts = 0
+    while len(tweets) < n and attempts < max_attempts:
         tweets.add(random_tweet())
+        attempts += 1
     return list(tweets)

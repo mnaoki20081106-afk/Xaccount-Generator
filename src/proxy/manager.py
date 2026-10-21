@@ -3,27 +3,42 @@
 - 1 スティッキーセッション に最大 max_accounts_per_ip 垢まで割り当て
 - 上限に達したら COOLDOWN_WEEKS 週間クーリング、その後リセットして再利用
 - セッション状態は data/proxy_sessions.json に永続保存
+- サーキットブレーカー: 連続失敗 CIRCUIT_THRESHOLD 回でセッション一時遮断
 """
+from __future__ import annotations
+
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
 import httpx
 from loguru import logger
 
 from ..config import ProxyConfig
 
-COOLDOWN_WEEKS = 3          # 上限到達後に休ませる週数
-SIGNUP_INTERVAL_HOURS = 2   # 同一 IP での連続サインアップ間隔
+COOLDOWN_WEEKS = 3
+SIGNUP_INTERVAL_HOURS = 2
+# サーキットブレーカー設定
+CIRCUIT_THRESHOLD = 4       # 連続失敗でオープン
+CIRCUIT_RESET_MINUTES = 30  # オープン後この時間経過で半オープン→再試行
 
 STATE_FILE = Path("data/proxy_sessions.json")
+
+_CHECK_URLS = [
+    "https://api.ipify.org?format=json",
+    "https://api.my-ip.io/ip.json",
+    "https://ip.seeip.org/jsonip",
+]
 
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
 
-def _parse_dt(s: str | None) -> datetime | None:
+
+def _parse_dt(s: str | None) -> Optional[datetime]:
     return datetime.fromisoformat(s) if s else None
 
 
@@ -41,12 +56,49 @@ class ProxySession:
         return self._d.get("account_count", 0)
 
     @property
-    def last_signup_at(self) -> datetime | None:
+    def last_signup_at(self) -> Optional[datetime]:
         return _parse_dt(self._d.get("last_signup_at"))
 
     @property
-    def cooldown_until(self) -> datetime | None:
+    def cooldown_until(self) -> Optional[datetime]:
         return _parse_dt(self._d.get("cooldown_until"))
+
+    # ── サーキットブレーカー ──
+    @property
+    def consecutive_failures(self) -> int:
+        return self._d.get("consecutive_failures", 0)
+
+    @property
+    def circuit_open_until(self) -> Optional[datetime]:
+        return _parse_dt(self._d.get("circuit_open_until"))
+
+    def is_circuit_open(self) -> bool:
+        until = self.circuit_open_until
+        if until and datetime.utcnow() < until:
+            return True
+        # 期限切れ → 自動リセット
+        if until and datetime.utcnow() >= until:
+            self._d["circuit_open_until"] = None
+            self._d["consecutive_failures"] = 0
+        return False
+
+    def record_health_failure(self):
+        fails = self.consecutive_failures + 1
+        self._d["consecutive_failures"] = fails
+        if fails >= CIRCUIT_THRESHOLD:
+            until = datetime.utcnow() + timedelta(minutes=CIRCUIT_RESET_MINUTES)
+            self._d["circuit_open_until"] = until.isoformat()
+            logger.warning(
+                f"Proxy session={self.session_id} circuit OPEN "
+                f"({fails} failures) until {until.strftime('%H:%M')}"
+            )
+
+    def record_health_success(self, exit_ip: str = ""):
+        self._d["consecutive_failures"] = 0
+        self._d["circuit_open_until"] = None
+        self._d["last_exit_ip"] = exit_ip
+
+    # ──────────────────────────────────────────
 
     @property
     def url(self) -> str:
@@ -55,18 +107,16 @@ class ProxySession:
         return f"http://{user}:{c.password}@{c.host}:{c.port}"
 
     def is_cooling(self) -> bool:
-        if not self.cooldown_until:
-            return False
-        return datetime.utcnow() < self.cooldown_until
+        cu = self.cooldown_until
+        return bool(cu and datetime.utcnow() < cu)
 
     def is_ready_for_signup(self, max_per_ip: int) -> bool:
-        """新規垢のサインアップに使えるか。"""
         if self.is_cooling():
             return False
-        # クーリング明けならカウントリセット済みかチェック
+        if self.is_circuit_open():
+            return False
         if self.account_count >= max_per_ip:
             return False
-        # 前回サインアップから SIGNUP_INTERVAL_HOURS 時間以上空いているか
         last = self.last_signup_at
         if last:
             elapsed = (datetime.utcnow() - last).total_seconds() / 3600
@@ -75,7 +125,6 @@ class ProxySession:
         return True
 
     def record_signup(self, max_per_ip: int):
-        """サインアップ1件記録。上限に達したらクーリング開始。"""
         self._d["account_count"] = self.account_count + 1
         self._d["last_signup_at"] = _now_iso()
         if self._d["account_count"] >= max_per_ip:
@@ -87,7 +136,6 @@ class ProxySession:
             )
 
     def maybe_reset_cooldown(self):
-        """クーリング期間が終わっていたらリセット。"""
         cu = self.cooldown_until
         if cu and datetime.utcnow() >= cu:
             self._d["account_count"] = 0
@@ -99,9 +147,9 @@ class ProxySession:
 class ProxyManager:
     def __init__(self, config: ProxyConfig):
         self.config = config
-        self._sessions: dict[str, dict] = {}         # session_id → raw dict
-        self._account_map: dict[str, str] = {}       # account_key → session_id
-        self._warmup_map: dict[str, str] = {}        # account_key → warmup session_id
+        self._sessions: dict[str, dict] = {}
+        self._account_map: dict[str, str] = {}
+        self._warmup_map: dict[str, str] = {}
         self._load_state()
 
     # ──────────────────────────────────────────
@@ -136,11 +184,6 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_proxy_for_account(self, account_key: str) -> ProxySession:
-        """
-        サインアップ用。同一IPは max_accounts_per_ip 垢まで使い回し、
-        クーリング後に再利用する。
-        """
-        # 既に割り当て済みなら返す
         if account_key in self._account_map:
             sid = self._account_map[account_key]
             if sid in self._sessions:
@@ -148,12 +191,13 @@ class ProxyManager:
 
         max_per_ip = self.config.max_accounts_per_ip
 
-        # クーリング明けのセッションをリセット
         for d in self._sessions.values():
             ProxySession(d, self.config).maybe_reset_cooldown()
 
-        # 既存セッションから使えるものを探す（古い順 = 安定した IP）
-        for sid, d in sorted(self._sessions.items(), key=lambda x: x[1].get("last_signup_at") or ""):
+        for sid, d in sorted(
+            self._sessions.items(),
+            key=lambda x: x[1].get("last_signup_at") or "",
+        ):
             sess = ProxySession(d, self.config)
             if sess.is_ready_for_signup(max_per_ip):
                 sess.record_signup(max_per_ip)
@@ -165,13 +209,15 @@ class ProxyManager:
                 )
                 return sess
 
-        # 新規セッション発行
         sid = str(uuid.uuid4())[:8]
         new_d: dict = {
             "session_id": sid,
             "account_count": 0,
             "last_signup_at": None,
             "cooldown_until": None,
+            "consecutive_failures": 0,
+            "circuit_open_until": None,
+            "last_exit_ip": "",
         }
         self._sessions[sid] = new_d
         sess = ProxySession(new_d, self.config)
@@ -186,14 +232,8 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_warmup_proxy(self, account_key: str) -> ProxySession:
-        """
-        ウォームアップ用。垢ごとに固有セッションIDで実質別IP。
-        account_key ベースのハッシュで固定するので再起動しても同じIP。
-        """
         sid = self._warmup_map.get(account_key)
         if not sid:
-            # account_key から決定論的なID生成
-            import hashlib
             sid = hashlib.md5(f"wu:{account_key}".encode()).hexdigest()[:8]
             self._warmup_map[account_key] = sid
 
@@ -203,28 +243,64 @@ class ProxyManager:
                 "account_count": 1,
                 "last_signup_at": None,
                 "cooldown_until": None,
+                "consecutive_failures": 0,
+                "circuit_open_until": None,
+                "last_exit_ip": "",
             }
         return ProxySession(self._sessions[sid], self.config)
 
     # ──────────────────────────────────────────
-    # ヘルスチェック
+    # ヘルスチェック（サーキットブレーカー連携）
     # ──────────────────────────────────────────
 
     async def health_check(self, session: ProxySession) -> bool:
-        try:
-            # httpx>=0.28 で proxies= は削除され proxy= (単数) のみ。
-            # これを直さないと最新 httpx 環境で全プロキシが unhealthy 判定になる。
-            async with httpx.AsyncClient(
-                proxy=session.url, timeout=15.0, follow_redirects=True
-            ) as client:
-                r = await client.get("https://api.ipify.org?format=json")
-                if r.status_code == 200:
-                    ip = r.json().get("ip", "?")
-                    logger.debug(f"Proxy OK exit_ip={ip} session={session.session_id}")
-                    return True
-        except Exception as e:
-            logger.warning(f"Proxy health check failed session={session.session_id}: {e}")
+        if session.is_circuit_open():
+            logger.debug(f"Proxy session={session.session_id} circuit OPEN, skip health check")
+            return False
+
+        for check_url in _CHECK_URLS:
+            try:
+                async with httpx.AsyncClient(
+                    proxy=session.url, timeout=12.0, follow_redirects=True
+                ) as client:
+                    r = await client.get(check_url)
+                    if r.status_code == 200:
+                        try:
+                            ip = r.json().get("ip") or r.json().get("query") or "?"
+                        except Exception:
+                            ip = r.text.strip()[:20]
+                        session.record_health_success(ip)
+                        self._save_state()
+                        logger.debug(
+                            f"Proxy OK exit_ip={ip} session={session.session_id}"
+                        )
+                        return True
+            except Exception as e:
+                logger.debug(f"Health check {check_url} failed: {e}")
+                continue
+
+        session.record_health_failure()
+        self._save_state()
+        logger.warning(f"Proxy health check failed session={session.session_id}")
         return False
+
+    async def health_check_all(self, concurrency: int = 5) -> dict[str, bool]:
+        """全セッションのヘルスチェックを並列実行。結果を {session_id: bool} で返す。"""
+        import asyncio
+
+        sem = asyncio.Semaphore(concurrency)
+        results: dict[str, bool] = {}
+
+        async def _check(sid: str):
+            async with sem:
+                sess = self._session_obj(sid)
+                ok = await self.health_check(sess)
+                results[sid] = ok
+
+        await asyncio.gather(*[_check(sid) for sid in list(self._sessions.keys())])
+        ok_count = sum(1 for v in results.values() if v)
+        logger.info(f"Proxy health: {ok_count}/{len(results)} healthy")
+        return results
 
     # ──────────────────────────────────────────
     # ユーティリティ
@@ -234,9 +310,19 @@ class ProxyManager:
         self._account_map.pop(account_key, None)
 
     def status_report(self) -> dict:
-        """現在のセッション状況サマリ。"""
         total = len(self._sessions)
-        cooling = sum(1 for d in self._sessions.values()
-                      if ProxySession(d, self.config).is_cooling())
-        ready = total - cooling
-        return {"total_sessions": total, "cooling": cooling, "ready": ready}
+        cooling = sum(
+            1 for d in self._sessions.values()
+            if ProxySession(d, self.config).is_cooling()
+        )
+        circuit_open = sum(
+            1 for d in self._sessions.values()
+            if ProxySession(d, self.config).is_circuit_open()
+        )
+        ready = total - cooling - circuit_open
+        return {
+            "total_sessions": total,
+            "cooling": cooling,
+            "circuit_open": circuit_open,
+            "ready": max(ready, 0),
+        }

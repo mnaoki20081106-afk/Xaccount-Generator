@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     email TEXT,
     phone TEXT,
     twofa_secret TEXT,
+    auth_token TEXT,
+    ct0 TEXT,
     status TEXT NOT NULL DEFAULT 'created',
     shadow_score REAL DEFAULT 0.0,
     proxy_id TEXT,
@@ -25,6 +27,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     sold_at TEXT,
     notes TEXT
 );
+
+-- auth_token / ct0 カラムをマイグレーション（既存DBへの追加）
+CREATE TABLE IF NOT EXISTS _migrations (key TEXT PRIMARY KEY);
+
 
 CREATE TABLE IF NOT EXISTS proxy_blacklist (
     ip TEXT PRIMARY KEY,
@@ -53,8 +59,36 @@ class Database:
         self.conn = await aiosqlite.connect(self.path)
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
+        await self._migrate()
         await self.conn.commit()
         logger.info(f"DB connected: {self.path}")
+
+    async def _migrate(self):
+        """既存DBへの非破壊カラム追加マイグレーション。"""
+        migrations = [
+            ("add_auth_token", "ALTER TABLE accounts ADD COLUMN auth_token TEXT"),
+            ("add_ct0",        "ALTER TABLE accounts ADD COLUMN ct0 TEXT"),
+        ]
+        for key, sql in migrations:
+            row = await (await self.conn.execute(
+                "SELECT key FROM _migrations WHERE key = ?", (key,)
+            )).fetchone()
+            if row:
+                continue
+            try:
+                await self.conn.execute(sql)
+                await self.conn.execute(
+                    "INSERT INTO _migrations (key) VALUES (?)", (key,)
+                )
+                logger.debug(f"Migration applied: {key}")
+            except Exception:
+                # カラムが既に存在する場合は無視してマーク
+                try:
+                    await self.conn.execute(
+                        "INSERT OR IGNORE INTO _migrations (key) VALUES (?)", (key,)
+                    )
+                except Exception:
+                    pass
 
     async def close(self):
         if hasattr(self, "conn"):
@@ -64,10 +98,11 @@ class Database:
         cursor = await self.conn.execute(
             """
             INSERT INTO accounts (
-                username, password, email, phone, twofa_secret, status,
-                shadow_score, proxy_id, fingerprint_hash, cookies_path,
-                created_at, last_action_at, sold_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                username, password, email, phone, twofa_secret,
+                auth_token, ct0, status, shadow_score, proxy_id,
+                fingerprint_hash, cookies_path, created_at, last_action_at,
+                sold_at, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account.username,
@@ -75,6 +110,8 @@ class Database:
                 account.email,
                 account.phone,
                 account.twofa_secret,
+                account.auth_token,
+                account.ct0,
                 account.status.value,
                 account.shadow_score,
                 account.proxy_id,
@@ -88,6 +125,13 @@ class Database:
         )
         await self.conn.commit()
         return cursor.lastrowid
+
+    async def update_tokens(self, account_id: int, auth_token: str, ct0: str):
+        await self.conn.execute(
+            "UPDATE accounts SET auth_token = ?, ct0 = ? WHERE id = ?",
+            (auth_token, ct0, account_id),
+        )
+        await self.conn.commit()
 
     async def get_account_by_username(self, username: str) -> Optional[Account]:
         cursor = await self.conn.execute(
@@ -167,6 +211,7 @@ class Database:
         return self._row_to_account(row)
 
     def _row_to_account(self, row) -> Account:
+        keys = row.keys() if hasattr(row, "keys") else []
         return Account(
             id=row["id"],
             username=row["username"],
@@ -174,6 +219,8 @@ class Database:
             email=row["email"],
             phone=row["phone"],
             twofa_secret=row["twofa_secret"],
+            auth_token=row["auth_token"] if "auth_token" in keys else None,
+            ct0=row["ct0"] if "ct0" in keys else None,
             status=AccountStatus(row["status"]),
             shadow_score=row["shadow_score"] or 0.0,
             proxy_id=row["proxy_id"],

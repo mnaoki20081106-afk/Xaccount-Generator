@@ -40,10 +40,18 @@ sms:
     - "netherlands"
 
 captcha:
-  # Playwright フォールバック時のソルバー:
-  #   "capsolver" / "2captcha" / "anticaptcha" / "local" / "none"
+  # ブラウザフロー時のソルバー:
+  #   "capsolver"  — https://capsolver.com  (汎用・実績あり)
+  #   "2captcha"   — https://2captcha.com
+  #   "anticaptcha"— https://anti-captcha.com
+  #   "capbypass"  — https://capbypass.com  (Outlook FunCaptcha に強い)
+  #   "none"
+  # provider → provider_fallback の順で自動フォールバック。
+  # 残高不足・連続失敗 3 回でプロバイダーを自動スキップ。
   provider: "capsolver"
   api_key: ""
+  provider_fallback: ""        # "capbypass" など2番手を入れると自動切り替え
+  api_key_fallback: ""
   # API フロー (api_flow.py) の Arkose 解決は CDS 優先、ローカルは補助。
   # ローカル solver は BDA 固定値が多く X に拒否されやすいので CDS キー推奨。
   # Telegram @keysolv_bot で無料キー取得可。
