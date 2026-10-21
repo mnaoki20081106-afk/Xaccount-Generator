@@ -53,6 +53,19 @@ X_VIEWER_URL = (
 X_ARKOSE_SURL = "https://client-api.arkoselabs.com"
 X_ARKOSE_KEY = "2CB16598-CB82-4CF7-B332-5990DB66F3AB"
 
+# 指紋一貫性: curl_cffi の impersonate と BDA/UA の Chrome major を揃える
+# chrome136 を使うなら UA も Chrome/136 で統一する
+IMPERSONATE_VERSION = "chrome136"
+CHROME_MAJOR = 136
+UA_STR = (
+    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36"
+)
+SEC_CH_UA = (
+    f'"Not/A)Brand";v="99", "Google Chrome";v="{CHROME_MAJOR}", '
+    f'"Chromium";v="{CHROME_MAJOR}"'
+)
+
 SUBTASK_VERSIONS: dict = {
     "action_list": 2, "alert_dialog": 1, "app_download_cta": 1,
     "check_logged_in_account": 1, "choice_selection": 3,
@@ -127,13 +140,17 @@ class XApiFlow:
         self.js_instrumentation: Optional[str] = None
         self.arkose_token: Optional[str] = None
 
-        # セッション
-        self._session = curl_requests.Session(impersonate="chrome136")
+        # セッション: UA / sec-ch-ua / impersonate を全部 Chrome major で揃える
+        self._session = curl_requests.Session(impersonate=IMPERSONATE_VERSION)
         self._session.headers.update({
             "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {X_BEARER}",
             "origin": "https://x.com",
             "referer": "https://x.com/",
+            "user-agent": UA_STR,
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
             "x-twitter-active-user": "yes",
             "x-twitter-client-language": "en",
         })
@@ -159,7 +176,10 @@ class XApiFlow:
     # ------------------------------------------------------------------
 
     def _solve_arkose_local(self, blob: str) -> Optional[str]:
-        """buggerlogger/arkose-solver Python ポートでローカル解決。"""
+        """buggerlogger/arkose-solver Python ポートでローカル解決。
+        suppressed=False (sup=1 in token) のときは拒否される可能性が高いので None 扱い。
+        指紋一貫性のため UA は api_flow と同じものを渡す。
+        """
         if not HAS_LOCAL_ARKOSE:
             return None
         try:
@@ -169,10 +189,18 @@ class XApiFlow:
                 site="https://x.com",
                 proxy=self.proxy_url,
                 language="en-US",
+                user_agent=UA_STR,
             )
             solver.data_blob = blob
             result = solver.solve()
-            logger.info(f"Arkose ローカル解決 suppressed={result.suppressed} timings={result.timings}")
+            logger.info(
+                f"Arkose ローカル解決 suppressed={result.suppressed} "
+                f"timings={result.timings}"
+            )
+            # suppressed=False (sup=1) のトークンは X で弾かれやすい → フォールバック
+            if result.suppressed:
+                logger.warning("Arkose ローカルトークン suppressed=False — CDS にフォールバック")
+                return None
             return result.token
         except Exception as e:
             logger.warning(f"Arkose ローカル解決失敗: {e}")
@@ -227,11 +255,21 @@ class XApiFlow:
         return None
 
     def _solve_arkose(self, blob: str) -> Optional[str]:
-        """ローカル → CDS の順で試す。"""
+        """CDS → ローカルの順。CDS がキー設定済みなら優先 (成功率が高い)。
+        ローカルは BDA 固定値が多く X に拒否されやすいので「無料試行」扱い。
+        """
+        if self.cds_api_key:
+            token = self._solve_arkose_cds(blob)
+            if token:
+                return token
+            logger.warning("CDS 失敗 — ローカル solver にフォールバック")
         token = self._solve_arkose_local(blob)
         if token:
             return token
-        return self._solve_arkose_cds(blob)
+        # CDS キーなし & ローカル失敗の場合、CDS を再試行 (キーが別経路で入っていれば)
+        if not self.cds_api_key:
+            logger.error("Arkose: CDS キー未設定かつローカル失敗。config.captcha.cds_api_key を設定推奨")
+        return None
 
     # ------------------------------------------------------------------
     # サインアップステップ
@@ -498,47 +536,246 @@ class XApiFlow:
     # メインフロー (同期)
     # ------------------------------------------------------------------
 
-    def run(self, email_code_fetcher) -> bool:
-        """
-        email_code_fetcher: メール確認コードを返す callable (同期 or Coroutine)。
-        実際の呼び出しは async_run() を使うこと。
-        """
-        from faker import Faker
-        self.full_name = Faker("ja_JP").name()
+    # ------------------------------------------------------------------
+    # レスポンス駆動の動的サブタスクディスパッチ
+    # ------------------------------------------------------------------
 
-        steps = [
-            ("guest_token",       self._step_guest_token),
-            ("js_instrumentation", self._step_js_instrumentation),
-            ("init_signup",        self._step_init_signup),
-            ("submit_profile",     lambda: self._step_submit_profile(self.full_name)),
-        ]
-        for name, fn in steps:
-            if not fn():
-                logger.error(f"API フロー失敗: ステップ={name}")
-                return False
+    def _build_subtask_input(self, subtask: dict, code: Optional[str]) -> Optional[dict]:
+        """
+        サーバーから返された subtask の種類に応じて、次に送る subtask_input を組み立てる。
+        未知の subtask は None を返し、呼び出し側でスキップ or 失敗判定。
+        """
+        sid = subtask.get("subtask_id", "")
 
-        # メール確認コード待ち
-        code = email_code_fetcher()
-        if not code:
-            logger.error("メール確認コード取得失敗")
+        # Arkose チャレンジ (Email / Register / Generic)
+        if sid.startswith("Arkose") or sid.endswith("ArkoseChallenge"):
+            if self.arkose_token is None:
+                web_modal = subtask.get("web_modal", {})
+                blob = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(web_modal.get("url", "")).query
+                ).get("data", [None])[0]
+                if blob:
+                    self.arkose_token = self._solve_arkose(blob) or ""
+                else:
+                    self.arkose_token = ""
+            return {
+                "subtask_id": sid,
+                "web_modal": {
+                    "completion_deeplink": (
+                        f"twitter://onboarding/web_modal/next_link"
+                        f"?access_token={self.arkose_token}"
+                    ),
+                    "link": "signup_with_email_next_link",
+                },
+            }
+
+        if sid == "Signup":
+            return {
+                "subtask_id": "Signup",
+                "sign_up": {
+                    "js_instrumentation": {"response": self.js_instrumentation or "{}"},
+                    "link": "email_next_link",
+                    "name": self.full_name,
+                    "email": self.email,
+                    "birthday": {
+                        "year": self.bd_year,
+                        "month": self.bd_month,
+                        "day": self.bd_day,
+                    },
+                    "personalization_settings": {
+                        "allow_cookie_use": True,
+                        "allow_device_personalization": True,
+                        "allow_partnerships": True,
+                        "allow_ads_personalization": True,
+                    },
+                },
+            }
+
+        if sid in ("EmailVerification", "SignupEmailVerification"):
+            if not code:
+                return None
+            return {
+                "subtask_id": sid,
+                "email_verification": {
+                    "code": code,
+                    "email": self.email,
+                    "link": "next_link",
+                },
+            }
+
+        if sid in ("EnterPassword", "SignupPassword"):
+            return {
+                "subtask_id": sid,
+                "enter_password": {"password": self.password, "link": "next_link"},
+            }
+
+        if sid in ("UsernameEntryBio", "SignupUsername", "EnterUsername"):
+            uname = self.username or _gen_username()
+            self.username = uname
+            return {
+                "subtask_id": sid,
+                "enter_username": {"username": uname, "link": "next_link"},
+            }
+
+        if sid in ("SelectAvatar", "UploadAvatar"):
+            return {"subtask_id": sid, "select_avatar": {"link": "skip_link"}}
+
+        if sid == "SelectBanner":
+            return {"subtask_id": sid, "select_banner": {"link": "skip_link"}}
+
+        if sid == "NotificationsPermissionPrompt":
+            return {
+                "subtask_id": sid,
+                "notifications_permission_prompt": {"link": "skip_link"},
+            }
+
+        if sid in ("ContactsLiveSyncPermissionPrompt",):
+            return {
+                "subtask_id": sid,
+                "contacts_live_sync_permission_prompt": {"link": "skip_link"},
+            }
+
+        if sid in ("StandAloneCategoryPickerBlockingNextURT", "InterestPicker"):
+            return {"subtask_id": sid, "generic_urt": {"link": "next_link"}}
+
+        if sid.startswith("UserRecommendations"):
+            return {
+                "subtask_id": sid,
+                "user_recommendations_urt": {
+                    "link": "next_link",
+                    "selected_user_recommendations": ["44196397"],
+                },
+            }
+
+        if sid in ("MenuDialog", "AlertDialog"):
+            return {"subtask_id": sid, "menu_dialog": {"link": "next_link"}}
+
+        if sid in ("OpenHomeTimeline", "OpenAccount"):
+            # 完了シグナル — 空の input で確定
+            return {"subtask_id": sid, "open_link": {"link": "next_link"}}
+
+        logger.warning(f"未知の subtask_id={sid} — スキップ")
+        return None
+
+    def _dispatch_loop(self, email_code_fetcher) -> bool:
+        """
+        初回レスポンス取得後、subtasks を見て次の input を動的に組み立てて送る。
+        EmailVerification が出た時点でメールコード取得を遅延実行する。
+        """
+        # 最初の signup 開始呼び出し
+        payload = {
+            "input_flow_data": {
+                "requested_variant": '{"signup_type":"phone_email"}',
+                "flow_context": {
+                    "debug_overrides": {},
+                    "start_location": {"location": "splash_screen"},
+                },
+            },
+            "subtask_versions": SUBTASK_VERSIONS,
+        }
+        data = self._post(f"{X_TASK_URL}?flow_name=signup", json=payload)
+        if "_raw_status" in data:
+            logger.error(f"init_signup HTTP {data['_raw_status']}: {data.get('_raw_text')}")
+            return False
+        self.flow_token = data.get("flow_token")
+        if not self.flow_token:
+            logger.error(f"flow_token なし: {data}")
             return False
 
-        remaining = [
-            ("verify_email",        lambda: self._step_verify_email(code)),
-            ("submit_password",     self._step_submit_password),
-            ("get_viewer",          self._step_get_viewer),
-            ("skip_avatar",         self._step_skip_avatar),
-            ("set_username",        self._step_set_username),
-            ("skip_notifications",  self._step_skip_notifications),
-            ("skip_category",       self._step_skip_category),
-            ("follow_seed_user",    self._step_follow_seed_user),
-            ("finish",              self._step_finish),
-        ]
-        for name, fn in remaining:
+        max_iterations = 25
+        code: Optional[str] = None
+
+        for i in range(max_iterations):
+            subtasks = data.get("subtasks", [])
+            if not subtasks:
+                logger.debug(f"iter={i}: subtasks 空 → 完了判定")
+                break
+
+            # 完了判定
+            if any(st.get("subtask_id") == "SuccessExit" for st in subtasks):
+                logger.debug("SuccessExit 検出")
+                break
+
+            # EmailVerification が出たらここでメールコードを取得
+            needs_code = any(
+                st.get("subtask_id") in ("EmailVerification", "SignupEmailVerification")
+                for st in subtasks
+            )
+            if needs_code and code is None:
+                code = email_code_fetcher()
+                if not code:
+                    logger.error("メール確認コード取得失敗")
+                    return False
+
+            # 全 subtask に対して input を組み立てる
+            subtask_inputs = []
+            for st in subtasks:
+                inp = self._build_subtask_input(st, code)
+                if inp:
+                    subtask_inputs.append(inp)
+
+            if not subtask_inputs:
+                logger.warning(f"iter={i}: 処理可能な subtask なし — subtasks={[s.get('subtask_id') for s in subtasks]}")
+                break
+
+            # password 送信後は ct0 を取り込む
+            data = self._post(X_TASK_URL, json={
+                "flow_token": self.flow_token,
+                "subtask_inputs": subtask_inputs,
+            })
+
+            if "_raw_status" in data:
+                logger.error(f"task HTTP {data['_raw_status']}: {data.get('_raw_text')}")
+                return False
+
+            self.flow_token = data.get("flow_token", self.flow_token)
+
+            # ct0 cookie を取り込み
+            ct0 = self._session.cookies.get("ct0")
+            if ct0 and ct0 != self.ct0:
+                self.ct0 = ct0
+                self._session.headers.update({"x-csrf-token": ct0})
+
+            # user info 抽出 (follow seed 時など)
+            for st in subtasks:
+                if st.get("subtask_id") == "UpdateUsers":
+                    try:
+                        users = st["update_users"]["users"]
+                        self.username = users[0].get("screen_name") or self.username
+                        self.user_id = users[0].get("id_str")
+                    except (KeyError, IndexError, TypeError):
+                        pass
+
+        # auth_token 取得確認
+        self.auth_token = self._session.cookies.get("auth_token")
+        if not self.auth_token:
+            logger.error("auth_token が cookie に出ていない (サインアップ失敗)")
+            return False
+        logger.info(
+            f"API サインアップ完了 @{self.username} auth_token={self.auth_token[:8]}..."
+        )
+        return True
+
+    def run(self, email_code_fetcher) -> bool:
+        """
+        email_code_fetcher: メール確認コードを返す callable。
+        実際の呼び出しは async_run() 推奨。
+        """
+        from faker import Faker
+        if not self.full_name:
+            self.full_name = Faker("ja_JP").name()
+
+        # 前段: guest_token, js_instrumentation 取得
+        for name, fn in [
+            ("guest_token", self._step_guest_token),
+            ("js_instrumentation", self._step_js_instrumentation),
+        ]:
             if not fn():
                 logger.error(f"API フロー失敗: ステップ={name}")
                 return False
-        return True
+
+        # 動的ディスパッチループ
+        return self._dispatch_loop(email_code_fetcher)
 
     # ------------------------------------------------------------------
     # 非同期ラッパー

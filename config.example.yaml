@@ -37,18 +37,23 @@ sms:
     - "philippines"
 
 captcha:
-  # "local"  → arkose-solver ローカル解決 (無料、外部APIキー不要)
-  # "capsolver" → capsolver.com ($0.6/1000件)
-  # "none"   → Arkose なし (SMS認証モードで迂回)
-  provider: "local"
-  api_key: ""                  # capsolver の場合のみ
-  # CDS Solver (cds-solver.com) — ローカル解決失敗時のフォールバック
-  # Telegram @keysolv_bot から無料キー取得可
+  # Playwright フォールバック時のソルバー:
+  #   "capsolver" / "2captcha" / "anticaptcha" / "local" / "none"
+  provider: "capsolver"
+  api_key: ""
+  # API フロー (api_flow.py) の Arkose 解決は CDS 優先、ローカルは補助。
+  # ローカル solver は BDA 固定値が多く X に拒否されやすいので CDS キー推奨。
+  # Telegram @keysolv_bot で無料キー取得可。
   cds_api_key: ""
 
 email:
-  provider: "outlook"           # Outlook固定（低コスト優先）
+  # "auto" (推奨): Outlook 優先 → 失敗したら mail.tm
+  # "outlook" / "mailtm" で明示指定可
+  # X は mail.tm 系の使い捨てドメインを弾くことが多いので Outlook を主にする
+  provider: "auto"
   api_key: ""
+  outlook_domain: "outlook.com"           # または hotmail.com
+  outlook_client_id: "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 
 twofa:
   enabled: true

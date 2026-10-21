@@ -70,8 +70,10 @@ FONT_SETS = [
 
 TREE_STRUCTURES = ["[[[],[]],[[]],[],[]]" ,"[[],[],[],[[]],[]]" ,"[[],[],[],[[]],[[]],[],[]]"]
 
-GREASE_BRANDS = {152: "Not?A_Brand", 151: "Not_A Brand", 150: "Not)A;Brand", 149: "Not-A.Brand"}
-CHROME_MAJORS = [148, 149, 150, 151, 152]
+# curl_cffi の impersonate=chrome136 と揃えるため 136 周辺に絞る。
+# TLS 指紋 (JA3) と UA / sec-ch-ua の Chrome major がズレると Arkose が怪しむ。
+GREASE_BRANDS = {137: "Not?A_Brand", 136: "Not_A Brand", 135: "Not)A;Brand", 134: "Not-A.Brand"}
+CHROME_MAJORS = [135, 136, 136, 136, 137]  # 136 を強く優先
 
 
 def _md5(s):
