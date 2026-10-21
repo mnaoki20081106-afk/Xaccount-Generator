@@ -30,8 +30,10 @@ class SmsConfig(BaseModel):
 
 
 class CaptchaConfig(BaseModel):
-    provider: str = "none"               # capsolver / local / none
+    provider: str = "none"               # capsolver / 2captcha / anticaptcha / local / none
     api_key: str = ""
+    provider_fallback: str = ""          # プライマリが失敗した際のフォールバック
+    api_key_fallback: str = ""
     # CDS Solver (cds-solver.com) APIキー — Arkose 解決のフォールバック
     # ローカル解決 (arkose_solver) が失敗した場合のみ使用
     cds_api_key: str = ""
