@@ -1,0 +1,482 @@
+[
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 2070 SUPER",
+  "deviceId": "0x00001E84",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 SUPER (0x00001E84) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 77
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 1650",
+  "deviceId": "0x00002188",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 (0x00002188) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 77
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x0000468B",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x0000468B) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 75
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) R4 Graphics",
+  "deviceId": "0x00009851",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) R4 Graphics (0x00009851) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 73
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon RX 6600 XT",
+  "deviceId": "0x000073FF",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon RX 6600 XT (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 71
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon 780M Graphics",
+  "deviceId": "0x000015BF",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon 780M Graphics (0x000015BF) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 68
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "deviceId": "0x00002D59",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 5060 Laptop GPU (0x00002D59) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 68
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 3060 Ti",
+  "deviceId": "0x00002486",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Ti (0x00002486) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 66
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) Graphics",
+  "deviceId": "0x0000A7AB",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) Graphics (0x0000A7AB) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 66
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 1050",
+  "deviceId": "0x00001C81",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 (0x00001C81) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 66
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 1650 SUPER",
+  "deviceId": "0x00002187",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER (0x00002187) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x00004688",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x00004688) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x000046D0",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x000046D0) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) 610M",
+  "deviceId": "0x0000164E",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) 610M (0x0000164E) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 2060",
+  "deviceId": "0x00001E89",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 (0x00001E89) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4060",
+  "deviceId": "0x00002808",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 (0x00002808) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 65
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "deviceId": "0x000028A1",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4050 Laptop GPU (0x000028A1) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 64
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics 630",
+  "deviceId": "0x00003E98",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E98) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 64
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) 860M Graphics",
+  "deviceId": "0x00001114",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) 860M Graphics (0x00001114) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 63
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon RX 6750 XT",
+  "deviceId": "0x000073DF",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon RX 6750 XT (0x000073DF) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 62
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) 610M",
+  "deviceId": "0x00001506",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) 610M (0x00001506) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 61
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 750",
+  "deviceId": "0x00001381",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 750 (0x00001381) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 61
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics 770",
+  "deviceId": "0x00004680",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x00004680) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 60
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) HD Graphics 530",
+  "deviceId": "0x0000191B",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) HD Graphics 530 (0x0000191B) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 59
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 2070",
+  "deviceId": "0x00001F07",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 (0x00001F07) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 57
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) Vega 8 Graphics",
+  "deviceId": "0x000015DD",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) Vega 8 Graphics (0x000015DD) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 57
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) HD Graphics 3000",
+  "deviceId": "0x00000116",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) HD Graphics 3000 (0x00000116) Direct3D11 vs_4_1 ps_4_1, D3D11)",
+  "weight": 57
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x00004628",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x00004628) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 56
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 1650",
+  "deviceId": "0x00001F99",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 (0x00001F99) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 55
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics 605",
+  "deviceId": "0x00003184",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 605 (0x00003184) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 55
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) Graphics",
+  "deviceId": "0x0000A7AC",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) Graphics (0x0000A7AC) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 54
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics 630",
+  "deviceId": "0x00003E91",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E91) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 53
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4080 SUPER",
+  "deviceId": "0x00002702",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4080 SUPER (0x00002702) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 53
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "deviceId": "0x00002520",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Laptop GPU (0x00002520) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 53
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) HD Graphics 505",
+  "deviceId": "0x00005A84",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) HD Graphics 505 (0x00005A84) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 52
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon RX 5500 XT",
+  "deviceId": "0x00007340",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon RX 5500 XT (0x00007340) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 50
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics 750",
+  "deviceId": "0x00004C8A",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics 750 (0x00004C8A) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 50
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) Arc(TM) A580 Graphics",
+  "deviceId": "0x000056A2",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) Arc(TM) A580 Graphics (0x000056A2) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 50
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x00009BCA",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x00009BCA) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 49
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 980",
+  "deviceId": "0x000013C0",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 980 (0x000013C0) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 49
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) RX Vega 11 Graphics",
+  "deviceId": "0x000015D8",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) RX Vega 11 Graphics (0x000015D8) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 47
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 2080",
+  "deviceId": "0x00001E87",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2080 (0x00001E87) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 47
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GT 740",
+  "deviceId": "0x00000FC8",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GT 740 (0x00000FC8) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 47
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4070 Ti",
+  "deviceId": "0x00002782",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Ti (0x00002782) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 46
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) HD Graphics 5300",
+  "deviceId": "0x0000161E",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) HD Graphics 5300 (0x0000161E) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 46
+ },
+ {
+  "vendor": "AMD",
+  "model": "NVIDIA GeForce RTX 4060",
+  "deviceId": "0x00006FDF",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, NVIDIA GeForce RTX 4060 (0x00006FDF) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 46
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) Graphics",
+  "deviceId": "0x0000164E",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) Graphics (0x0000164E) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 45
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 550 Ti",
+  "deviceId": "0x00001244",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 550 Ti (0x00001244) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 45
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon RX 9070 XT",
+  "deviceId": "0x00007550",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon RX 9070 XT (0x00007550) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 44
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce GTX 1070 Ti",
+  "deviceId": "0x00001B82",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1070 Ti (0x00001B82) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 44
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x0000A721",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x0000A721) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 43
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4060 Ti",
+  "deviceId": "0x00002805",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Ti (0x00002805) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 42
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 3090",
+  "deviceId": "0x00002204",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3090 (0x00002204) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 41
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 4090",
+  "deviceId": "0x00002684",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 (0x00002684) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 41
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) UHD Graphics",
+  "deviceId": "0x000046D1",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x000046D1) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 40
+ },
+ {
+  "vendor": "Intel",
+  "model": "Intel(R) HD Graphics 610",
+  "deviceId": "0x00005906",
+  "glVendor": "Google Inc. (Intel)",
+  "glRenderer": "ANGLE (Intel, Intel(R) HD Graphics 610 (0x00005906) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 40
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 5070 Laptop GPU",
+  "deviceId": "0x00002D18",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 5070 Laptop GPU (0x00002D18) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 40
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce RTX 5050",
+  "deviceId": "0x00002D83",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 5050 (0x00002D83) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 40
+ },
+ {
+  "vendor": "NVIDIA",
+  "model": "NVIDIA GeForce 8400GS",
+  "deviceId": "0x000010C3",
+  "glVendor": "Google Inc. (NVIDIA)",
+  "glRenderer": "ANGLE (NVIDIA, NVIDIA GeForce 8400GS (0x000010C3) Direct3D11 vs_4_1 ps_4_1, D3D11)",
+  "weight": 39
+ },
+ {
+  "vendor": "AMD",
+  "model": "AMD Radeon(TM) Vega 3 Graphics",
+  "deviceId": "0x000015DD",
+  "glVendor": "Google Inc. (AMD)",
+  "glRenderer": "ANGLE (AMD, AMD Radeon(TM) Vega 3 Graphics (0x000015DD) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "weight": 39
+ }
+]
