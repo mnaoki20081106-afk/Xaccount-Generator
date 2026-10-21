@@ -1,99 +1,104 @@
-"""Per-solve device generation from the embedded weighted population.
-
-devices.json is the same file the Go implementation embeds: 234 GPUs,
-105 screens, 13 core counts, 4 memory sizes, 62 connection profiles.
-"""
-
 import json
 import os
 import random
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE = os.path.dirname(__file__)
 _POOL = None
-
-CHROME_COLOR_DEPTH = 24
-INNER_WIDTH_INSET = 16
-INNER_HEIGHT_INSET = 95
 
 
 def _pool():
     global _POOL
     if _POOL is None:
-        with open(os.path.join(_HERE, "devices.json"), encoding="utf-8") as fh:
-            _POOL = json.load(fh)
+        def _load(fn):
+            with open(os.path.join(_HERE, fn), encoding="utf-8") as fh:
+                return json.load(fh)
+        misc = _load("devices_misc.json")
+        _POOL = {
+            "gpus": (_load("devices_gpus_1.json") + _load("devices_gpus_2.json") +
+                     _load("devices_gpus_3.json") + _load("devices_gpus_4.json")),
+            "screens": _load("devices_screens.json"),
+            "cores": misc["cores"],
+            "memory": misc["memory"],
+            "network": misc["network"],
+            "base": misc.get("base", {}),
+        }
         for name in ("gpus", "screens", "cores", "memory", "network"):
             if not _POOL.get(name):
-                raise RuntimeError("devices.json is missing pool %r" % name)
+                raise RuntimeError("devices split files are missing pool %r" % name)
     return _POOL
 
 
-def _pick(entries):
-    total = sum(e["weight"] for e in entries if e.get("weight", 0) > 0)
-    if total <= 0:
-        return entries[0]
-    r = random.randrange(total)
-    for e in entries:
-        w = e.get("weight", 0)
-        if w <= 0:
-            continue
-        r -= w
-        if r < 0:
-            return e
-    return entries[0]
+def _pick(pool):
+    total = sum(e["weight"] for e in pool)
+    r = random.uniform(0, total)
+    for entry in pool:
+        r -= entry["weight"]
+        if r <= 0:
+            return entry
+    return pool[-1]
 
 
-def js_heap_size_limit(device_memory_gb):
-    """enhanced_fp[\"basfas\"] carries performance.memory.jsHeapSizeLimit."""
-    if device_memory_gb >= 8:
-        return 4395630592
-    if device_memory_gb >= 4:
+def js_heap_size_limit(memory_gb):
+    if memory_gb <= 4:
+        return 2172649472
+    elif memory_gb <= 8:
         return 4294705152
-    return 2197815296
+    else:
+        return 8589934592
 
 
-def _window_on(screen):
-    avail_w = screen.get("availWidth") or screen["width"]
-    avail_h = screen.get("availHeight") or screen["height"]
-    if random.randrange(100) < 35:
-        return avail_w, avail_h
-    w = avail_w * random.randint(60, 100) // 100
-    h = avail_h * random.randint(60, 100) // 100
-    w = max(w, INNER_WIDTH_INSET + 200)
-    h = max(h, INNER_HEIGHT_INSET + 200)
-    return w, h
+def _window_on(base, screen):
+    dpr = screen.get("dpr", 1)
+    sw = screen["width"]
+    sh = screen["height"]
+    aw = screen.get("availWidth", sw)
+    ah = screen.get("availHeight", sh)
+    taskbar = sh - ah
+    iw = int(aw * 0.5)
+    ih = ah - taskbar
+    ow = iw + 16
+    oh = ah
+    return {
+        "screen": {
+            "width": sw,
+            "height": sh,
+            "availWidth": aw,
+            "availHeight": ah,
+            "colorDepth": screen.get("colorDepth", 24),
+            "pixelDepth": screen.get("colorDepth", 24),
+        },
+        "devicePixelRatio": dpr,
+        "innerWidth": iw,
+        "innerHeight": ih,
+        "outerWidth": ow,
+        "outerHeight": oh,
+    }
 
 
 def generate_device():
-    """A fresh, internally coherent synthetic machine."""
-    pool = _pool()
-    gpu = _pick(pool["gpus"])
-    screen = _pick(pool["screens"])
-    net = _pick(pool["network"])
-    outer_w, outer_h = _window_on(screen)
-
+    p = _pool()
+    gpu = _pick(p["gpus"])
+    screen = _pick(p["screens"])
+    cores = _pick(p["cores"])["value"]
+    memory = _pick(p["memory"])["value"]
+    net = _pick(p["network"])
+    win = _window_on(p["base"], screen)
     return {
-        "gpu_vendor": gpu["vendor"],
-        "gpu_model": gpu["model"],
-        "gl_vendor": gpu["glVendor"],
-        "gl_renderer": gpu["glRenderer"],
-        "screen_width": screen["width"],
-        "screen_height": screen["height"],
-        "avail_width": screen.get("availWidth") or screen["width"],
-        "avail_height": screen.get("availHeight") or screen["height"],
-        "color_depth": CHROME_COLOR_DEPTH,
-        "device_pixel_ratio": screen.get("dpr", 1),
-        "outer_width": outer_w,
-        "outer_height": outer_h,
-        "inner_width": outer_w - INNER_WIDTH_INSET,
-        "inner_height": outer_h - INNER_HEIGHT_INSET,
-        "device_memory": _pick(pool["memory"])["value"],
-        "hardware_concurrency": _pick(pool["cores"])["value"],
-        "downlink": net["downlink"],
-        "rtt": net["rtt"],
-        "save_data": net.get("saveData", False),
+        **win,
+        "hardwareConcurrency": cores,
+        "deviceMemory": memory,
+        "jsHeapSizeLimit": js_heap_size_limit(memory),
+        "connection": {
+            "effectiveType": "4g",
+            "downlink": net["downlink"],
+            "rtt": net["rtt"],
+            "saveData": net["saveData"],
+        },
+        "glVendor": gpu["vendor"],
+        "glRenderer": gpu["renderer"],
     }
 
 
 def pool_sizes():
     p = _pool()
-    return {k: len(p[k]) for k in ("gpus", "screens", "cores", "memory", "network")}
+    return {k: len(v) if isinstance(v, list) else 1 for k, v in p.items()}
