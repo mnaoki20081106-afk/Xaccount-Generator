@@ -692,9 +692,23 @@ class AccountFactory:
             pass
         return None
 
-    async def _get_email(self, username: str) -> tuple[str | None, MailTmClient | None]:
+    async def _get_email(self, username: str) -> tuple[str | None, object]:
         provider = self.config.email.provider
-        if not provider or provider == "mailtm":
+        if provider == "outlook":
+            from ..email_provider.outlook import OutlookClient
+            proxy = self.proxy_manager.get_proxy_for_account(username)
+            client = OutlookClient(
+                browser_manager=self.browser,
+                captcha_client=self._captcha_client,
+                proxy_url=proxy.url,
+                domain=self.config.email.outlook_domain,
+                client_id=self.config.email.outlook_client_id,
+            )
+            ok = await client.create_account()
+            if ok and client.address:
+                return client.address, client
+            await client.close()
+        elif not provider or provider == "mailtm":
             client = MailTmClient()
             ok = await client.create_account()
             if ok and client.address:

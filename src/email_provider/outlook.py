@@ -1,225 +1,600 @@
 """
-Outlook / Hotmail アカウント生成モジュール。
+Outlook / Hotmail アカウント生成 + Graph API メール受信。
 
-注意:
-- Microsoftの登録はCaptcha・電話認証・リスクベース判定が非常に厳しい
-- 成功率はプロキシ品質・指紋・レートに大きく依存する
-- このモジュールは「自動化の骨格」を提供する。実環境での調整が必須
+フロー:
+  1. patchright でサインアップ (ステートマシン方式)
+  2. サインアップ中の回復メール検証は一時 MailTmClient で処理
+  3. 登録後に OAuth2 authorization code → refresh_token を取得
+  4. wait_for_code() は Graph API でポーリング
+
+MailTmClient と同じインターフェース:
+  create_account() / address / wait_for_code() / get_latest_code() / close()
 """
+from __future__ import annotations
+
 import asyncio
 import random
 import re
-from datetime import datetime
-from pathlib import Path
+import secrets
+import string
+import time
 from typing import Optional
+from urllib.parse import urlparse, parse_qs
+
+import httpx
 from loguru import logger
-from faker import Faker
 
-from ..utils.browser import BrowserManager
-from ..proxy.manager import ProxyManager
-from ..config import AppConfig
+# ──────────────────────────────────────────────────────────────
+# 定数
+# ──────────────────────────────────────────────────────────────
 
-fake = Faker("ja_JP")
+SIGNUP_URL = "https://signup.live.com/signup"
+
+# Microsoft Graph / OAuth2
+_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+_GRAPH_MESSAGES = "https://graph.microsoft.com/v1.0/me/messages"
+_SCOPES = "https://graph.microsoft.com/Mail.Read offline_access"
+
+# デフォルト client_id: Outlook Web App の公開 ID
+_DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+_REDIRECT_URI = "https://localhost"
+
+# ステップ検出プローブ
+_STEP_PROBES = {
+    "username":  ['input[name="MemberName"]', '#floatingLabelInput10', 'input[aria-label*="メール"]'],
+    "password":  ['input[type="password"]', 'input[name="Password"]', '#PasswordInput'],
+    "firstname": ['input[name="FirstName"]', '#FirstName', 'input[aria-label*="名"]'],
+    "birthday":  ['select[name="BirthYear"]', '#BirthYear', 'input[name="BirthYear"]'],
+    "captcha":   ['iframe#enforcementFrame'],
+    "recovery":  ['input[name="MemberName"][type="email"]', 'input[aria-label*="回復"]',
+                  'input[placeholder*="email" i]'],
+    "verify":    ['input[name="otc"]', '#idTxtBx_OTC_Password', 'input[aria-label*="コード"]',
+                  'input[maxlength="6"]', 'input[maxlength="8"]'],
+    "agree":     ['input[id*="iAccrualCancel"]', 'input[value*="同意"]', 'input[value*="Agree"]',
+                  'button:has-text("同意")'],
+    "done":      ['#meControl', '[data-task="profile"]', 'a[href*="account.microsoft.com"]'],
+}
+
+_NEXT_SELECTORS = [
+    '[data-testid="primaryButton"]',
+    'input[type="submit"]',
+    'button[type="submit"]',
+    '#iSignupAction',
+    'input[value*="次"]',
+    'input[value*="Next"]',
+    'button:has-text("次へ")',
+]
+
+# ──────────────────────────────────────────────────────────────
+# ヘルパー
+# ──────────────────────────────────────────────────────────────
+
+def _gen_local(length: int | None = None) -> str:
+    length = length or random.randint(11, 17)
+    chars = string.ascii_lowercase + string.digits
+    return secrets.choice(string.ascii_lowercase) + "".join(
+        secrets.choice(chars) for _ in range(length - 1)
+    )
 
 
-class OutlookGenerator:
+def _gen_password(n: int = 14) -> str:
+    symbols = "!@#$%^&*"
+    pool = string.ascii_letters + string.digits + symbols
+    while True:
+        pw = "".join(secrets.choice(pool) for _ in range(n))
+        if (any(c.isupper() for c in pw)
+                and any(c.islower() for c in pw)
+                and any(c.isdigit() for c in pw)
+                and any(c in symbols for c in pw)):
+            return pw
+
+
+def _gen_name() -> tuple[str, str]:
+    first = secrets.choice(string.ascii_uppercase) + "".join(
+        secrets.choice(string.ascii_lowercase) for _ in range(random.randint(3, 7))
+    )
+    last = secrets.choice(string.ascii_uppercase) + "".join(
+        secrets.choice(string.ascii_lowercase) for _ in range(random.randint(3, 7))
+    )
+    return first, last
+
+
+async def _human(lo: float = 0.5, hi: float = 1.5):
+    await asyncio.sleep(random.uniform(lo, hi))
+
+
+def _iso_ago(seconds: int) -> str:
+    from datetime import datetime, timezone, timedelta
+    dt = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ──────────────────────────────────────────────────────────────
+# OutlookClient
+# ──────────────────────────────────────────────────────────────
+
+class OutlookClient:
+    """
+    Outlook アカウントを新規作成し、Graph API でメール受信する。
+    account_factory.py の _get_email() から MailTmClient の代替として使う。
+    """
+
     def __init__(
         self,
-        config: AppConfig,
-        proxy_manager: ProxyManager,
-        browser_manager: BrowserManager,
+        browser_manager,
+        captcha_client=None,
+        proxy_url: str | None = None,
+        domain: str = "outlook.com",
+        client_id: str = _DEFAULT_CLIENT_ID,
     ):
-        self.config = config
-        self.proxy_manager = proxy_manager
         self.browser = browser_manager
+        self.captcha_client = captcha_client
+        self.proxy_url = proxy_url
+        self.domain = domain
+        self.client_id = client_id
 
-    async def create_one(self) -> Optional[dict]:
-        """
-        Outlookアカウントを1つ作成して結果を返す。
-        成功時: {email, password, cookies_path, status}
-        失敗時: None
-        """
-        local_part = self._gen_local_part()
-        password = self._gen_password()
-        # まずは outlook.com を試す（hotmail.com も可）
-        desired_email = f"{local_part}@outlook.com"
+        # 登録後に設定される
+        self.address: str | None = None
+        self.password: str | None = None
+        self._refresh_token: str | None = None
+        self._access_token: str | None = None
+        self._token_expires_at: float = 0.0
+        self._context = None
 
-        proxy = self.proxy_manager.get_proxy_for_account(f"outlook_{local_part}")
-        logger.info(f"[Outlook] trying {desired_email} via session={proxy.session_id}")
+    # ──────────────────────────────────────────
+    # 公開 API
+    # ──────────────────────────────────────────
 
-        healthy = await self.proxy_manager.health_check(proxy)
-        if not healthy:
-            logger.warning("[Outlook] proxy unhealthy")
-            return None
+    async def create_account(self) -> bool:
+        local = _gen_local()
+        password = _gen_password()
+        email = f"{local}@{self.domain}"
 
-        context = None
+        self._context = await self.browser.new_context(proxy_url=self.proxy_url)
+        page = await self.browser.new_page(self._context, block_resources=False)
+        page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
+
         try:
-            context = await self.browser.new_context(proxy_url=proxy.url)
-            page = await self.browser.new_page(context)
+            ok = await self._run_signup(page, local, password, email)
+            if not ok:
+                return False
 
-            success, final_email = await self._run_signup_flow(
-                page, local_part, password
-            )
+            # OAuth2 で refresh_token 取得（失敗しても wait_for_code は後で再試行可能）
+            await self._acquire_tokens(page)
 
-            if not success or not final_email:
-                logger.warning(f"[Outlook] signup failed for {local_part}")
-                return None
-
-            cookies_dir = Path("data/cookies/outlook")
-            cookies_dir.mkdir(parents=True, exist_ok=True)
-            cookies_path = str(cookies_dir / f"{local_part}.json")
-            await self.browser.save_cookies(context, cookies_path)
-
-            result = {
-                "email": final_email,
-                "password": password,
-                "cookies_path": cookies_path,
-                "proxy_id": proxy.session_id,
-                "created_at": datetime.utcnow().isoformat(),
-                "status": "created",
-            }
-            logger.success(f"[Outlook] created {final_email}")
-            return result
+            self.address = email
+            self.password = password
+            logger.success(f"[Outlook] {email} 作成完了 token={'yes' if self._refresh_token else 'no'}")
+            return True
 
         except Exception as e:
-            logger.exception(f"[Outlook] error: {e}")
-            return None
+            logger.exception(f"[Outlook] create_account failed: {e}")
+            return False
         finally:
-            if context:
-                await context.close()
+            await page.close()
 
-    async def _run_signup_flow(
-        self, page, local_part: str, password: str
-    ) -> tuple[bool, Optional[str]]:
-        """
-        Microsoftアカウント登録フローの骨格。
-        セレクタは変更されやすいので実環境で要調整。
-        """
+    async def wait_for_code(
+        self,
+        subject_keyword: str = "Twitter",
+        timeout: int = 150,
+        poll_interval: int = 5,
+    ) -> str | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            code = await self.get_latest_code(subject_keyword=subject_keyword)
+            if code:
+                return code
+            await asyncio.sleep(poll_interval)
+        logger.warning(f"[Outlook] {subject_keyword} コードタイムアウト ({timeout}s)")
+        return None
+
+    async def get_latest_code(self, subject_keyword: str = "Twitter") -> str | None:
+        token = await self._ensure_access_token()
+        if not token:
+            logger.debug("[Outlook] access_token なし — コード取得スキップ")
+            return None
+
+        proxy_kwargs = {"proxy": self.proxy_url} if self.proxy_url else {}
         try:
-            # 公式のサインアップ入口
-            await page.goto(
-                "https://signup.live.com/",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            await self._delay(2.0, 4.0)
-            logger.debug("[Outlook] signup page loaded")
+            async with httpx.AsyncClient(timeout=30, **proxy_kwargs) as client:
+                params: dict = {
+                    "$top": "10",
+                    "$select": "subject,body,receivedDateTime",
+                    "$orderby": "receivedDateTime DESC",
+                    "$filter": f"receivedDateTime gt {_iso_ago(600)}",
+                }
+                r = await client.get(
+                    _GRAPH_MESSAGES,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Prefer": 'outlook.body-content-type="text"',
+                    },
+                    params=params,
+                )
+                for msg in r.json().get("value", []):
+                    text = (
+                        msg.get("body", {}).get("content", "")
+                        + " "
+                        + msg.get("subject", "")
+                    )
+                    if subject_keyword and subject_keyword.lower() not in text.lower():
+                        continue
+                    m = re.search(r"\b(\d{6,8})\b", text)
+                    if m:
+                        return m.group(1)
+        except Exception as e:
+            logger.debug(f"[Outlook] graph fetch failed: {e}")
+        return None
 
-            # メール入力欄
-            email_selectors = [
-                'input[type="email"]',
-                'input[name="MemberName"]',
-                '#MemberName',
-                'input[aria-label*="mail"]',
-            ]
-            if not await self._fill_first(page, email_selectors, local_part):
-                # ドメイン選択が別の場合がある
-                logger.debug("[Outlook] trying alternative email fill")
-
-            await self._delay(0.8, 1.5)
-
-            # 次へ
-            next_selectors = [
-                'input[type="submit"]',
-                'button[type="submit"]',
-                '#iSignupAction',
-                'input[value*="次"]',
-                'input[value*="Next"]',
-            ]
-            await self._click_first(page, next_selectors)
-            await self._delay(2.0, 3.5)
-
-            # パスワード入力
-            pass_selectors = [
-                'input[type="password"]',
-                'input[name="Password"]',
-                '#PasswordInput',
-            ]
-            if not await self._fill_first(page, pass_selectors, password):
-                logger.warning("[Outlook] password field not found")
-                return False, None
-
-            await self._delay(0.8, 1.5)
-            await self._click_first(page, next_selectors)
-            await self._delay(2.0, 4.0)
-
-            # 名前
-            first_name = fake.first_name()
-            last_name = fake.last_name()
-            await self._fill_first(
-                page,
-                ['input[name="FirstName"]', '#FirstName'],
-                first_name,
-            )
-            await self._delay(0.4, 0.9)
-            await self._fill_first(
-                page,
-                ['input[name="LastName"]', '#LastName'],
-                last_name,
-            )
-            await self._delay(0.6, 1.2)
-            await self._click_first(page, next_selectors)
-            await self._delay(2.0, 3.5)
-
-            # 生年月日（セレクトが多い）
-            # ここでは存在するセレクトを埋める試みだけする
+    async def close(self):
+        if self._context:
             try:
-                await self._try_fill_birthdate(page)
+                await self._context.close()
             except Exception:
                 pass
+            self._context = None
 
-            await self._click_first(page, next_selectors)
-            await self._delay(3.0, 5.0)
+    # ──────────────────────────────────────────
+    # サインアップ ステートマシン
+    # ──────────────────────────────────────────
 
-            # ここから先に Captcha / 電話認証 / 追加確認 が入りやすい
-            # 成功判定の簡易チェック
-            content = await page.content()
-            current_url = page.url
+    async def _run_signup(self, page, local: str, password: str, email: str) -> bool:
+        await page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=60000)
+        await _human(1.5, 3.0)
 
-            if "account.microsoft" in current_url or "privacynotice" in current_url.lower():
-                final_email = f"{local_part}@outlook.com"
-                logger.info(f"[Outlook] possible success → {final_email}")
-                return True, final_email
+        first_name, last_name = _gen_name()
+        year = random.randint(1988, 2002)
+        month = random.randint(1, 12)
+        day = random.randint(1, 28)
 
-            # 電話番号要求やCaptchaが出ているかログに残す
-            if any(k in content.lower() for k in ["phone", "電話", "captcha", "ロボット"]):
-                logger.warning("[Outlook] phone or captcha challenge detected")
-                return False, None
+        # 回復メール用の一時クライアント（サインアップ中に必要な場合）
+        recovery_client = None
+        recovery_address = None
 
-            logger.warning("[Outlook] could not confirm success")
-            return False, None
+        completed: set[str] = set()
+        stall = 0
+        last_step = ""
+        deadline = time.monotonic() + 600
 
-        except Exception as e:
-            logger.error(f"[Outlook] flow error: {e}")
-            return False, None
+        while time.monotonic() < deadline:
+            step = await self._detect_step(page)
 
-    async def _try_fill_birthdate(self, page):
-        """生年月日セレクトを埋める簡易処理。"""
-        # 年
-        year = str(random.randint(1988, 2002))
-        month = str(random.randint(1, 12))
-        day = str(random.randint(1, 28))
+            if step == "done":
+                logger.debug(f"[Outlook] signup done url={page.url}")
+                break
 
+            if step == "unknown":
+                stall += 1
+                # done 的な URL になっていれば抜ける
+                url = page.url
+                if any(k in url for k in ("account.microsoft", "outlook.live", "outlook.com/mail")):
+                    logger.debug(f"[Outlook] done via URL: {url}")
+                    break
+                if stall > 15:
+                    logger.error(f"[Outlook] unknown 状態でスタック url={url}")
+                    return False
+                await asyncio.sleep(1.5)
+                continue
+
+            if step == "captcha":
+                await self._handle_captcha(page)
+                stall = 0
+                await _human(2.0, 4.0)
+                continue
+
+            if step == last_step:
+                stall += 1
+                if stall > 8:
+                    logger.error(f"[Outlook] step={step} でスタック")
+                    return False
+                await asyncio.sleep(1.5)
+                continue
+
+            stall = 0
+            last_step = step
+
+            try:
+                if step == "username" and step not in completed:
+                    await self._fill(page, _STEP_PROBES["username"], local)
+                    # ドメイン変更 (hotmail.com の場合)
+                    if self.domain == "hotmail.com":
+                        await self._switch_domain(page)
+                    await _human(0.5, 1.0)
+                    await self._click_next(page)
+                    await _human(1.5, 3.0)
+
+                elif step == "password" and step not in completed:
+                    await self._fill(page, _STEP_PROBES["password"], password)
+                    await _human(0.5, 1.0)
+                    await self._click_next(page)
+                    await _human(1.5, 3.0)
+
+                elif step == "firstname" and step not in completed:
+                    await self._fill(page, ['input[name="FirstName"]', '#FirstName'], first_name)
+                    await _human(0.3, 0.6)
+                    await self._fill(page, ['input[name="LastName"]', '#LastName'], last_name)
+                    await _human(0.5, 1.0)
+                    await self._click_next(page)
+                    await _human(1.5, 3.0)
+
+                elif step == "birthday" and step not in completed:
+                    await self._fill_birthday(page, year, month, day)
+                    await _human(0.5, 1.0)
+                    await self._click_next(page)
+                    await _human(1.5, 3.0)
+
+                elif step == "recovery" and step not in completed:
+                    # 回復メール要求 — 一時メールで対応
+                    if recovery_client is None:
+                        from .mailtm import MailTmClient
+                        recovery_client = MailTmClient()
+                        ok = await recovery_client.create_account()
+                        recovery_address = recovery_client.address if ok else None
+
+                    if recovery_address:
+                        logger.debug(f"[Outlook] recovery email → {recovery_address}")
+                        await self._fill(page, _STEP_PROBES["recovery"], recovery_address)
+                        await _human(0.5, 1.0)
+                        await self._click_next(page)
+                        await _human(2.0, 4.0)
+                    else:
+                        # スキップ試行
+                        if not await self._try_skip(page):
+                            logger.error("[Outlook] recovery email 取得失敗かつスキップ不可")
+                            return False
+
+                elif step == "verify" and step not in completed:
+                    # 回復メールへのコード
+                    code = None
+                    if recovery_client:
+                        code = await recovery_client.wait_for_code(
+                            subject_keyword="Microsoft", timeout=120
+                        )
+                    if not code:
+                        logger.error("[Outlook] verify code 取得失敗")
+                        return False
+                    await self._fill(page, _STEP_PROBES["verify"], code)
+                    await _human(0.5, 1.0)
+                    await self._click_next(page)
+                    await _human(2.0, 4.0)
+
+                elif step == "agree":
+                    await self._click_first(page, _STEP_PROBES["agree"])
+                    await _human(1.0, 2.0)
+                    completed.add("agree")
+                    continue  # stall リセットのため continue
+
+                completed.add(step)
+
+            except Exception as e:
+                logger.error(f"[Outlook] handler {step} failed: {e}")
+                stall += 1
+                await asyncio.sleep(2.0)
+
+        if recovery_client:
+            await recovery_client.close()
+
+        url = page.url
+        return any(k in url for k in (
+            "account.microsoft", "outlook.live", "outlook.com/mail",
+            "privacynotice", "live.com/mail"
+        ))
+
+    # ──────────────────────────────────────────
+    # ステップ検出
+    # ──────────────────────────────────────────
+
+    async def _detect_step(self, page) -> str:
+        url = page.url
+        # done 判定を URL で優先
+        if any(k in url for k in ("account.microsoft", "outlook.live", "outlook.com/mail")):
+            return "done"
+
+        for step, selectors in _STEP_PROBES.items():
+            try:
+                for sel in selectors:
+                    loc = page.locator(sel).first
+                    if await loc.count() and await loc.is_visible(timeout=500):
+                        return step
+            except Exception:
+                continue
+        return "unknown"
+
+    # ──────────────────────────────────────────
+    # 各ステップハンドラ
+    # ──────────────────────────────────────────
+
+    async def _fill_birthday(self, page, year: int, month: int, day: int):
         for sel, val in [
-            ('select[name="BirthYear"]', year),
-            ('select[name="BirthMonth"]', month),
-            ('select[name="BirthDay"]', day),
-            ('#BirthYear', year),
-            ('#BirthMonth', month),
-            ('#BirthDay', day),
+            ('select[name="BirthYear"]', str(year)),
+            ('select[name="BirthMonth"]', str(month)),
+            ('select[name="BirthDay"]', str(day)),
+            ('#BirthYear', str(year)),
+            ('#BirthMonth', str(month)),
+            ('#BirthDay', str(day)),
         ]:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=1000):
-                    await loc.select_option(val)
+                if await loc.count() and await loc.is_visible(timeout=800):
+                    tag = await loc.evaluate("el => el.tagName.toLowerCase()")
+                    if tag == "select":
+                        await loc.select_option(value=val)
+                    else:
+                        await loc.fill(val)
+                    await _human(0.2, 0.5)
             except Exception:
                 continue
 
-    async def _fill_first(self, page, selectors: list[str], value: str) -> bool:
+    async def _handle_captcha(self, page):
+        if not self.captcha_client:
+            logger.warning("[Outlook] captcha 検出 — solver 未設定、30s 待機")
+            await asyncio.sleep(30)
+            return
+
+        public_key = None
+        try:
+            frame = page.locator("iframe#enforcementFrame").first
+            src = await frame.get_attribute("src") or ""
+            m = re.search(r'[?&](?:public_key|pk)=([A-Za-z0-9\-]+)', src)
+            if m:
+                public_key = m.group(1)
+                logger.debug(f"[Outlook] captcha key: {public_key}")
+        except Exception:
+            pass
+
+        if not public_key:
+            logger.warning("[Outlook] captcha public_key 抽出失敗")
+            return
+
+        token = await self.captcha_client.solve_funcaptcha(
+            website_url="https://signup.live.com",
+            website_public_key=public_key,
+            proxy=self.proxy_url,
+        )
+        if not token:
+            logger.warning("[Outlook] captcha 解決失敗")
+            return
+
+        await page.evaluate("""
+            (token) => {
+                for (const n of ['funcaptcha_token', 'arkose_token', 'fc-token']) {
+                    const el = document.querySelector(`input[name="${n}"]`);
+                    if (el) {
+                        el.value = token;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+                const f = document.querySelector('iframe#enforcementFrame');
+                if (f) {
+                    try {
+                        f.contentWindow.postMessage(JSON.stringify({
+                            eventId: 'challenge-complete',
+                            payload: { sessionToken: token }
+                        }), '*');
+                    } catch(e) {}
+                }
+            }
+        """, token)
+        await _human(1.0, 2.0)
+        logger.debug("[Outlook] captcha トークン注入完了")
+
+    async def _switch_domain(self, page):
+        """@hotmail.com に切り替える。"""
+        try:
+            for sel in ['button.domain-select', '[aria-haspopup="listbox"]', '[aria-haspopup="true"]']:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible(timeout=1000):
+                    await loc.click()
+                    await _human(0.3, 0.6)
+                    break
+            opt = page.locator('[role="option"]:text-is("@hotmail.com")').first
+            if await opt.count():
+                await opt.click()
+        except Exception:
+            pass
+
+    async def _try_skip(self, page) -> bool:
+        for sel in [
+            'a:has-text("Skip")', 'button:has-text("Skip")',
+            'a:has-text("スキップ")', 'button:has-text("スキップ")',
+            'input[value*="skip" i]',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible(timeout=800):
+                    await loc.click()
+                    await _human(0.5, 1.0)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # ──────────────────────────────────────────
+    # OAuth2 / Graph API
+    # ──────────────────────────────────────────
+
+    async def _acquire_tokens(self, page):
+        """サインアップ完了済みページから OAuth2 code を取得して refresh_token に交換。"""
+        auth_url = (
+            f"{_AUTH_URL}"
+            f"?client_id={self.client_id}"
+            f"&response_type=code"
+            f"&redirect_uri={_REDIRECT_URI}"
+            f"&scope={_SCOPES.replace(' ', '%20')}"
+            f"&response_mode=query"
+            f"&prompt=none"
+        )
+        try:
+            # localhost へのリダイレクトは失敗するが URL に code が乗る
+            await page.goto(auth_url, wait_until="domcontentloaded", timeout=20000)
+        except Exception:
+            pass
+
+        url = page.url
+        m = re.search(r'[?&]code=([^&]+)', url)
+        if not m:
+            logger.debug("[Outlook] auth code 未取得 — token なし")
+            return
+
+        code = m.group(1)
+        proxy_kwargs = {"proxy": self.proxy_url} if self.proxy_url else {}
+        try:
+            async with httpx.AsyncClient(timeout=30, **proxy_kwargs) as client:
+                r = await client.post(_TOKEN_URL, data={
+                    "client_id": self.client_id,
+                    "code": code,
+                    "redirect_uri": _REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                    "scope": _SCOPES,
+                })
+                data = r.json()
+                if "refresh_token" in data:
+                    self._refresh_token = data["refresh_token"]
+                    self._access_token = data.get("access_token")
+                    self._token_expires_at = time.time() + data.get("expires_in", 3600) - 60
+                    logger.debug("[Outlook] refresh_token 取得成功")
+                else:
+                    logger.debug(f"[Outlook] token exchange failed: {data.get('error_description', data)}")
+        except Exception as e:
+            logger.debug(f"[Outlook] token exchange error: {e}")
+
+    async def _ensure_access_token(self) -> str | None:
+        if self._access_token and time.time() < self._token_expires_at:
+            return self._access_token
+        if not self._refresh_token:
+            return None
+
+        proxy_kwargs = {"proxy": self.proxy_url} if self.proxy_url else {}
+        try:
+            async with httpx.AsyncClient(timeout=30, **proxy_kwargs) as client:
+                r = await client.post(_TOKEN_URL, data={
+                    "client_id": self.client_id,
+                    "refresh_token": self._refresh_token,
+                    "grant_type": "refresh_token",
+                    "scope": _SCOPES,
+                })
+                data = r.json()
+                if "access_token" in data:
+                    self._access_token = data["access_token"]
+                    self._token_expires_at = time.time() + data.get("expires_in", 3600) - 60
+                    if "refresh_token" in data:
+                        self._refresh_token = data["refresh_token"]
+                    return self._access_token
+        except Exception as e:
+            logger.debug(f"[Outlook] token refresh error: {e}")
+        return None
+
+    # ──────────────────────────────────────────
+    # 共通ヘルパー
+    # ──────────────────────────────────────────
+
+    async def _fill(self, page, selectors: list[str], value: str) -> bool:
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=2500):
+                if await loc.count() and await loc.is_visible(timeout=1500):
                     await loc.fill(value)
                     return True
             except Exception:
@@ -230,21 +605,12 @@ class OutlookGenerator:
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=2500):
+                if await loc.count() and await loc.is_visible(timeout=1500):
                     await loc.click()
                     return True
             except Exception:
                 continue
         return False
 
-    async def _delay(self, min_s: float, max_s: float):
-        await asyncio.sleep(random.uniform(min_s, max_s))
-
-    def _gen_local_part(self) -> str:
-        base = fake.user_name().replace(".", "").replace("_", "")[:8].lower()
-        suffix = fake.random_number(digits=3)
-        return f"{base}{suffix}"
-
-    def _gen_password(self) -> str:
-        # Microsoftのパスワード要件を満たす強めのもの
-        return fake.password(length=16, special_chars=True, digits=True, upper_case=True)
+    async def _click_next(self, page) -> bool:
+        return await self._click_first(page, _NEXT_SELECTORS)

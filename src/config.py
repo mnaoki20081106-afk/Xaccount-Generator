@@ -48,6 +48,8 @@ class FactoryConfig(BaseModel):
 class EmailConfig(BaseModel):
     provider: str = ""
     api_key: str = ""
+    outlook_domain: str = "outlook.com"
+    outlook_client_id: str = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 
 
 class TwoFAConfig(BaseModel):
