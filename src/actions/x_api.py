@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+from contextlib import nullcontext
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -198,12 +199,26 @@ class XApiClient:
         self.ct0 = ct0
         self.proxy_url = proxy_url
         self._proxy_key = proxy_url or "direct"
+        self._open_session: Optional[AsyncSession] = None
 
-    def _session(self) -> AsyncSession:
+    def _session_kwargs(self) -> dict:
         kwargs: dict = {"impersonate": _IMPERSONATE, "timeout": 20}
         if self.proxy_url:
             kwargs["proxies"] = {"https": self.proxy_url, "http": self.proxy_url}
-        return AsyncSession(**kwargs)
+        return kwargs
+
+    def _session(self) -> AsyncSession:
+        return AsyncSession(**self._session_kwargs())
+
+    async def __aenter__(self) -> "XApiClient":
+        """Open a persistent session reused across all calls (avoids repeated TLS handshakes)."""
+        self._open_session = AsyncSession(**self._session_kwargs())
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        if self._open_session:
+            await self._open_session.close()
+            self._open_session = None
 
     async def _tid(self, session, method: str, url: str) -> Optional[str]:
         """Generate x-client-transaction-id for the given request."""
@@ -218,7 +233,9 @@ class XApiClient:
             return None
 
     async def _get(self, url: str, params: dict = None) -> Optional[dict]:
-        async with self._session() as s:
+        s = self._open_session
+        async with (nullcontext(s) if s else self._session()) as _s:
+            s = s or _s
             tid = await self._tid(s, "GET", url)
             r = await s.get(
                 url,
@@ -234,7 +251,9 @@ class XApiClient:
             return body
 
     async def _post(self, url: str, data: dict = None) -> Optional[dict]:
-        async with self._session() as s:
+        s = self._open_session
+        async with (nullcontext(s) if s else self._session()) as _s:
+            s = s or _s
             tid = await self._tid(s, "POST", url)
             h = {**_base_headers(self.ct0, tid), "Content-Type": "application/x-www-form-urlencoded"}
             r = await s.post(

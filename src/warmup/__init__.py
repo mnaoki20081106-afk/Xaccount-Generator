@@ -131,60 +131,61 @@ class WarmupScheduler:
     async def _run_api(
         self, account: Account, phase: WarmupPhase, proxy_url: Optional[str]
     ) -> dict:
-        client = XApiClient(account.auth_token, account.ct0, proxy_url=proxy_url)
         limits = PHASE_LIMITS[phase]
         results = {"mode": "api", "phase": phase.value, "tweets": 0, "likes": 0, "follows": 0, "browse": 0}
 
-        # トークン有効確認（失敗したらブラウザフォールバック）
-        if not await client.verify():
-            logger.warning(f"[{account.username}] API token invalid, falling back to browser")
-            return await self._run_browser(account, phase, proxy_url)
+        # 1 セッションを全アクションで共有（TLS ハンドシェイク 1 回）
+        async with XApiClient(account.auth_token, account.ct0, proxy_url=proxy_url) as client:
+            # トークン有効確認（失敗したらブラウザフォールバック）
+            if not await client.verify():
+                logger.warning(f"[{account.username}] API token invalid, falling back to browser")
+                return await self._run_browser(account, phase, proxy_url)
 
-        # OBSERVE: ブラウズのみ
-        if phase == WarmupPhase.OBSERVE:
-            if await self._can_do(account.id, "browse", phase):
-                ok = await client.browse(count=random.randint(10, 20))
-                if ok:
-                    await self._log(account.id, "browse", "observe_api")
-                    results["browse"] += 1
-                await asyncio.sleep(random.uniform(30, 90))
+            # OBSERVE: ブラウズのみ
+            if phase == WarmupPhase.OBSERVE:
+                if await self._can_do(account.id, "browse", phase):
+                    ok = await client.browse(count=random.randint(10, 20))
+                    if ok:
+                        await self._log(account.id, "browse", "observe_api")
+                        results["browse"] += 1
+                    await asyncio.sleep(random.uniform(30, 90))
 
-        # いいね
-        target_likes = random.randint(max(1, limits["likes"] // 2), limits["likes"])
-        if target_likes > 0 and await self._can_do(account.id, "likes", phase):
-            liked = await client.like_random_from_timeline(count=target_likes)
-            if liked > 0:
-                await self._log(account.id, "likes", str(liked))
-            results["likes"] = liked
-            await asyncio.sleep(random.uniform(10, 30))
+            # いいね
+            target_likes = random.randint(max(1, limits["likes"] // 2), limits["likes"])
+            if target_likes > 0 and await self._can_do(account.id, "likes", phase):
+                liked = await client.like_random_from_timeline(count=target_likes)
+                if liked > 0:
+                    await self._log(account.id, "likes", str(liked))
+                results["likes"] = liked
+                await asyncio.sleep(random.uniform(10, 30))
 
-        # フォロー
-        if limits["follows"] > 0 and await self._can_do(account.id, "follows", phase):
-            if random.random() < 0.5:
-                n = random.randint(1, min(3, limits["follows"]))
-                followed = await client.follow_suggestions(count=n)
-                if followed > 0:
-                    await self._log(account.id, "follows", f"suggestions_api:{followed}")
-                    results["follows"] += followed
-            elif self.follow_targets:
-                target = random.choice(self.follow_targets)
-                if await client.follow(target):
-                    await self._log(account.id, "follows", target)
-                    results["follows"] += 1
-            await asyncio.sleep(random.uniform(10, 25))
+            # フォロー
+            if limits["follows"] > 0 and await self._can_do(account.id, "follows", phase):
+                if random.random() < 0.5:
+                    n = random.randint(1, min(3, limits["follows"]))
+                    followed = await client.follow_suggestions(count=n)
+                    if followed > 0:
+                        await self._log(account.id, "follows", f"suggestions_api:{followed}")
+                        results["follows"] += followed
+                elif self.follow_targets:
+                    target = random.choice(self.follow_targets)
+                    if await client.follow(target):
+                        await self._log(account.id, "follows", target)
+                        results["follows"] += 1
+                await asyncio.sleep(random.uniform(10, 25))
 
-        # ツイート
-        if limits["tweets"] > 0 and await self._can_do(account.id, "tweets", phase):
-            if random.random() < 0.6:
-                text = (
-                    random.choice(self.tweet_templates)
-                    if self.tweet_templates
-                    else random_tweet()
-                )
-                if await client.tweet(text):
-                    await self._log(account.id, "tweets", text[:40])
-                    results["tweets"] += 1
-                await asyncio.sleep(random.uniform(15, 45))
+            # ツイート
+            if limits["tweets"] > 0 and await self._can_do(account.id, "tweets", phase):
+                if random.random() < 0.6:
+                    text = (
+                        random.choice(self.tweet_templates)
+                        if self.tweet_templates
+                        else random_tweet()
+                    )
+                    if await client.tweet(text):
+                        await self._log(account.id, "tweets", text[:40])
+                        results["tweets"] += 1
+                    await asyncio.sleep(random.uniform(15, 45))
 
         logger.info(f"[{account.username}] warmup(api) done phase={phase.value}: {results}")
         return results
