@@ -47,6 +47,8 @@ _STEP_PROBES = {
     "firstname": ['input[name="FirstName"]', '#FirstName', 'input[aria-label*="名"]'],
     "birthday":  ['select[name="BirthYear"]', '#BirthYear', 'input[name="BirthYear"]'],
     "captcha":   ['iframe#enforcementFrame'],
+    "phone":     ['input[name="PhoneNumber"]', 'input[type="tel"]', '#idTxtBx_PhoneNumber',
+                  'input[aria-label*="電話"]', 'input[placeholder*="phone" i]'],
     "recovery":  ['input[name="MemberName"][type="email"]', 'input[aria-label*="回復"]',
                   'input[placeholder*="email" i]'],
     "verify":    ['input[name="otc"]', '#idTxtBx_OTC_Password', 'input[aria-label*="コード"]',
@@ -127,12 +129,14 @@ class OutlookClient:
         proxy_url: str | None = None,
         domain: str = "outlook.com",
         client_id: str = _DEFAULT_CLIENT_ID,
+        sms_client=None,
     ):
         self.browser = browser_manager
         self.captcha_client = captcha_client
         self.proxy_url = proxy_url
         self.domain = domain
         self.client_id = client_id
+        self.sms_client = sms_client  # FiveSimClient or compatible — for phone verification
 
         # 登録後に設定される
         self.address: str | None = None
@@ -251,6 +255,9 @@ class OutlookClient:
         # 回復メール用の一時クライアント（サインアップ中に必要な場合）
         recovery_client = None
         recovery_address = None
+        # 電話認証用（sms_clientがあれば使う）
+        phone_order_id: str | None = None
+        phone_number: str | None = None
 
         completed: set[str] = set()
         stall = 0
@@ -324,6 +331,20 @@ class OutlookClient:
                     await self._click_next(page)
                     await _human(1.5, 3.0)
 
+                elif step == "phone" and step not in completed:
+                    result = await self._handle_phone(page)
+                    if result == "skip":
+                        completed.add(step)
+                    elif result == "ok":
+                        phone_order_id = getattr(self, "_last_phone_order_id", None)
+                        phone_number = getattr(self, "_last_phone_number", None)
+                        completed.add(step)
+                    else:
+                        # Phone failed — try skip
+                        if not await self._try_skip(page):
+                            logger.error("[Outlook] phone step 失敗かつスキップ不可")
+                            return False
+
                 elif step == "recovery" and step not in completed:
                     # 回復メール要求 — 一時メールで対応
                     if recovery_client is None:
@@ -345,9 +366,12 @@ class OutlookClient:
                             return False
 
                 elif step == "verify" and step not in completed:
-                    # 回復メールへのコード
                     code = None
-                    if recovery_client:
+                    # 電話認証コードを優先
+                    if phone_order_id and self.sms_client:
+                        code = await self.sms_client.wait_for_sms(phone_order_id, timeout_s=90)
+                    # 次に回復メールコード
+                    if not code and recovery_client:
                         code = await recovery_client.wait_for_code(
                             subject_keyword="Microsoft", timeout=120
                         )
@@ -447,11 +471,35 @@ class OutlookClient:
             logger.warning("[Outlook] captcha public_key 抽出失敗")
             return
 
-        token = await self.captcha_client.solve_funcaptcha(
-            website_url="https://signup.live.com",
-            website_public_key=public_key,
-            proxy=self.proxy_url,
-        )
+        # CapBypass を優先 (Outlook FunCaptcha の成功率が高い)
+        # CaptchaManager の場合は内部プロバイダーから CapBypassClient を探す
+        capbypass = None
+        if hasattr(self.captcha_client, "_providers"):
+            for entry in self.captcha_client._providers:
+                if type(entry.client).__name__ == "CapBypassClient" and not entry.disabled:
+                    capbypass = entry.client
+                    break
+
+        token = None
+        if capbypass:
+            try:
+                token = await capbypass.solve_funcaptcha(
+                    website_url="https://signup.live.com",
+                    website_public_key=public_key,
+                    proxy=self.proxy_url,
+                )
+                if token:
+                    logger.debug("[Outlook] captcha solved via CapBypass")
+            except Exception as e:
+                logger.debug(f"[Outlook] CapBypass failed: {e}, falling back")
+                token = None
+
+        if not token:
+            token = await self.captcha_client.solve_funcaptcha(
+                website_url="https://signup.live.com",
+                website_public_key=public_key,
+                proxy=self.proxy_url,
+            )
         if not token:
             logger.warning("[Outlook] captcha 解決失敗")
             return
@@ -479,6 +527,47 @@ class OutlookClient:
         """, token)
         await _human(1.0, 2.0)
         logger.debug("[Outlook] captcha トークン注入完了")
+
+    async def _handle_phone(self, page) -> str:
+        """
+        電話番号ステップを処理。
+        sms_client があれば番号を取得して入力、なければスキップを試みる。
+        戻り値: "ok" | "skip" | "fail"
+        """
+        # まずスキップできるか試す
+        if await self._try_skip(page):
+            logger.debug("[Outlook] phone step スキップ成功")
+            return "skip"
+
+        if not self.sms_client:
+            logger.debug("[Outlook] sms_client 未設定 — phone スキップ試行のみ")
+            return "fail"
+
+        try:
+            order_id, phone = await self.sms_client.get_number()
+            if not order_id or not phone:
+                logger.warning("[Outlook] 電話番号取得失敗")
+                return "fail"
+
+            # +国番号なしで入力（Microsoft は自動補完する）
+            phone_input = phone.lstrip("+")
+            filled = await self._fill(page, _STEP_PROBES["phone"], phone_input)
+            if not filled:
+                await self.sms_client.cancel(order_id)
+                return "fail"
+
+            await _human(0.5, 1.0)
+            await self._click_next(page)
+            await _human(2.0, 4.0)
+
+            # order_id を保存して verify ステップで SMS を取得できるようにする
+            self._last_phone_order_id = order_id
+            self._last_phone_number = phone_input
+            logger.debug(f"[Outlook] phone={phone_input} 入力完了 order={order_id}")
+            return "ok"
+        except Exception as e:
+            logger.error(f"[Outlook] _handle_phone error: {e}")
+            return "fail"
 
     async def _switch_domain(self, page):
         """@hotmail.com に切り替える。"""

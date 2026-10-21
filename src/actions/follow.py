@@ -45,6 +45,47 @@ class FollowAction:
         finally:
             await page.close()
 
+    async def follow_suggestions(
+        self, context, account: Account, count: int = 2
+    ) -> int:
+        """X の「おすすめ」ページからフォロー。ターゲット一覧不要。"""
+        page = await self.browser.new_page(context)
+        followed = 0
+        try:
+            await page.goto(
+                "https://x.com/i/connect_people",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+
+            for sel in [
+                'div[role="button"]:has-text("フォロー"):not(:has-text("フォロー中"))',
+                'div[role="button"]:has-text("Follow"):not(:has-text("Following"))',
+            ]:
+                try:
+                    btns = await page.locator(sel).all()
+                    for btn in btns[:count - followed]:
+                        if await btn.is_visible():
+                            await btn.scroll_into_view_if_needed()
+                            await asyncio.sleep(random.uniform(1.0, 2.5))
+                            await btn.click()
+                            followed += 1
+                            await asyncio.sleep(random.uniform(2.0, 5.0))
+                            if followed >= count:
+                                break
+                except Exception:
+                    continue
+                if followed >= count:
+                    break
+
+            logger.info(f"[{account.username}] followed {followed} suggestions")
+        except Exception as e:
+            logger.error(f"[{account.username}] follow_suggestions error: {e}")
+        finally:
+            await page.close()
+        return followed
+
     async def unfollow(self, context, target_username: str, account: Account) -> bool:
         page = await self.browser.new_page(context)
         try:

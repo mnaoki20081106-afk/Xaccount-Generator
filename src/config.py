@@ -20,6 +20,7 @@ class BrowserConfig(BaseModel):
     headless: bool = True
     slow_mo: int = 50
     default_timeout: int = 30000
+    max_concurrent_browsers: int = 2
 
 
 class SmsConfig(BaseModel):

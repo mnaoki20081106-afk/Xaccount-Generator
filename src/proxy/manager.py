@@ -237,14 +237,19 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_warmup_proxy(self, account_key: str) -> ProxySession:
-        sid = self._warmup_map.get(account_key)
-        if not sid:
-            sid = hashlib.md5(f"wu:{account_key}".encode()).hexdigest()[:8]
-            self._warmup_map[account_key] = sid
+        # Reuse the creation session — same IP = consistent fingerprint chain
+        sid = self._account_map.get(account_key)
+        if sid and sid in self._sessions:
+            return ProxySession(self._sessions[sid], self.config)
 
-        if sid not in self._sessions:
-            self._sessions[sid] = {
-                "session_id": sid,
+        # Fallback: warmup-dedicated session
+        wu_sid = self._warmup_map.get(account_key)
+        if not wu_sid:
+            wu_sid = hashlib.md5(f"wu:{account_key}".encode()).hexdigest()[:8]
+            self._warmup_map[account_key] = wu_sid
+        if wu_sid not in self._sessions:
+            self._sessions[wu_sid] = {
+                "session_id": wu_sid,
                 "account_count": 1,
                 "last_signup_at": None,
                 "cooldown_until": None,
@@ -252,7 +257,8 @@ class ProxyManager:
                 "circuit_open_until": None,
                 "last_exit_ip": "",
             }
-        return ProxySession(self._sessions[sid], self.config)
+        self._save_state()
+        return ProxySession(self._sessions[wu_sid], self.config)
 
     # ──────────────────────────────────────────
     # ヘルスチェック（サーキットブレーカー連携）

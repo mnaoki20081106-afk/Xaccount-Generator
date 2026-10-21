@@ -58,6 +58,7 @@ class Orchestrator:
             headless=config.browser.headless,
             slow_mo=config.browser.slow_mo,
             timeout=config.browser.default_timeout,
+            max_concurrent=config.browser.max_concurrent_browsers,
         )
 
         self.login_action = LoginAction(self.browser, self.twofa_manager, config.twofa.encryption_key)
@@ -82,11 +83,13 @@ class Orchestrator:
             self.tweet_action,
             self.follow_action,
             self.like_action,
+            db=self.db,
         )
 
     async def start(self):
         await self.db.connect()
-        await self.browser.start()
+        # Browser uses lazy start — it starts on first new_context() call,
+        # so warmup-only invocations don't pay the browser startup cost.
         logger.info("Orchestrator started")
 
     async def stop(self):

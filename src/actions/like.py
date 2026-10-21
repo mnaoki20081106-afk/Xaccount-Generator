@@ -45,6 +45,26 @@ class LikeAction:
         finally:
             await page.close()
 
+    async def browse_timeline(
+        self, context, account: Account, scroll_count: int = 5
+    ) -> bool:
+        """閲覧のみ（いいねなし）— OBSERVE フェーズ用。人間らしいスクロール行動。"""
+        page = await self.browser.new_page(context)
+        try:
+            await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+            for _ in range(scroll_count):
+                # 読んでいる風にゆっくりスクロール
+                await page.mouse.wheel(0, random.randint(200, 600))
+                await asyncio.sleep(random.uniform(3.0, 9.0))
+            logger.info(f"[{account.username}] browsed timeline ({scroll_count} scrolls)")
+            return True
+        except Exception as e:
+            logger.error(f"[{account.username}] browse_timeline error: {e}")
+            return False
+        finally:
+            await page.close()
+
     async def like_timeline_random(
         self, context, account: Account, count: int = 3
     ) -> int:

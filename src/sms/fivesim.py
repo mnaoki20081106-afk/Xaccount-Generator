@@ -211,6 +211,29 @@ class FiveSimClient:
             except Exception:
                 pass
 
+    async def acquire_sms(
+        self,
+        product: str = X_PRODUCT,
+        max_attempts: int = 3,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        番号取得 → SMS待機の一体型。タイムアウト時は即キャンセル後に別番号で再試行。
+        戻り値: (phone, code) — 失敗時は (None, None)
+        """
+        countries = await self._get_best_countries(product)
+        for attempt, country in enumerate(countries[:max_attempts]):
+            order_id, phone = await self._buy_number(product, country)
+            if not order_id:
+                continue
+            code = await self.wait_for_sms(order_id)
+            if code:
+                return phone, code
+            logger.info(
+                f"5sim SMS timeout attempt={attempt + 1}/{max_attempts}, trying next country"
+            )
+        logger.error(f"5sim acquire_sms failed after {max_attempts} attempts")
+        return None, None
+
     async def cancel(self, order_id: str):
         await self._cancel_order(order_id)
 

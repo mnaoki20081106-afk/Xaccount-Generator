@@ -73,6 +73,33 @@ async def cmd_run(config, target: int, gen_concurrency: int, warmup_concurrency:
         await orc.stop()
 
 
+async def cmd_worker(config, worker_type: str, concurrency: int, target: int):
+    """
+    プロセス分離ワーカー。生成ワーカーとウォームアップワーカーを別プロセスで起動できる。
+    2GB VPS 向け: generate と warmup を別プロセスに分けることでメモリ競合を防ぐ。
+
+    使い方:
+        python -m src.main worker --type generate &
+        python -m src.main worker --type warmup
+    """
+    orc = Orchestrator(config)
+    await orc.start()
+    try:
+        if worker_type == "generate":
+            logger.info(f"Worker: generate (target={target}, concurrency={concurrency})")
+            await orc.generate_accounts(target, concurrency=concurrency)
+        elif worker_type == "warmup":
+            logger.info(f"Worker: warmup (concurrency={concurrency})")
+            await orc.run_warmup_cycle(concurrency=concurrency)
+        elif worker_type == "check":
+            logger.info("Worker: shadowban check")
+            await orc.run_shadowban_check()
+        else:
+            logger.error(f"Unknown worker type: {worker_type}")
+    finally:
+        await orc.stop()
+
+
 async def cmd_list(config):
     from .db import Database
     from .models import AccountStatus
@@ -118,6 +145,14 @@ def main():
     p_run.add_argument("--warmup-concurrency", type=int, default=5)
     p_run.add_argument("--interval-hours", type=float, default=6.0)
 
+    p_worker = sub.add_parser("worker", help="プロセス分離ワーカー（2GB VPS向け）")
+    p_worker.add_argument(
+        "--type", choices=["generate", "warmup", "check"], required=True,
+        help="ワーカー種別: generate / warmup / check"
+    )
+    p_worker.add_argument("--concurrency", type=int, default=1, help="同時実行数（VPSは1推奨）")
+    p_worker.add_argument("--target", type=int, default=100, help="generate時の目標垢数")
+
     sub.add_parser("list", help="垢一覧を表示")
     sub.add_parser("status", help="垢一覧を表示（listの別名）")
 
@@ -148,6 +183,8 @@ def main():
             args.warmup_concurrency,
             args.interval_hours,
         ))
+    elif args.command == "worker":
+        asyncio.run(cmd_worker(config, args.type, args.concurrency, args.target))
     elif args.command in ("list", "status"):
         asyncio.run(cmd_list(config))
     elif args.command == "serve":

@@ -61,14 +61,27 @@ def _make_sec_ch_ua(major: str) -> str:
 
 
 class BrowserManager:
-    def __init__(self, headless: bool = True, slow_mo: int = 50, timeout: int = 30000):
+    def __init__(
+        self,
+        headless: bool = True,
+        slow_mo: int = 50,
+        timeout: int = 30000,
+        max_concurrent: int = 2,
+    ):
         self.headless = headless
         self.slow_mo = slow_mo
         self.timeout = timeout
+        self.max_concurrent = max_concurrent
         self._playwright = None
         self._browser: Optional[Browser] = None
+        self._sem: Optional[object] = None      # asyncio.Semaphore — created on first use
+        self._start_lock: Optional[object] = None  # asyncio.Lock
 
     async def start(self):
+        if self._sem is None:
+            import asyncio as _asyncio
+            self._sem = _asyncio.Semaphore(self.max_concurrent)
+            self._start_lock = _asyncio.Lock()
         self._playwright = await async_playwright().start()
         launch_args = [
             "--no-sandbox",
@@ -109,8 +122,15 @@ class BrowserManager:
         timezone_id: str = "Asia/Tokyo",
         device: Optional[dict] = None,
     ) -> BrowserContext:
+        # Lazy start: initialize on first use so the browser only runs when needed
         if not self._browser:
-            raise RuntimeError("Browser not started. Call start() first.")
+            import asyncio as _asyncio
+            if self._start_lock is None:
+                self._sem = _asyncio.Semaphore(self.max_concurrent)
+                self._start_lock = _asyncio.Lock()
+            async with self._start_lock:
+                if not self._browser:
+                    await self.start()
 
         major = _pick_chrome_version()
         ua = _make_ua(major)
@@ -284,18 +304,23 @@ class BrowserManager:
 
         return context
 
-    async def new_page(self, context: BrowserContext, block_resources: bool = True) -> Page:
+    async def new_page(
+        self,
+        context: BrowserContext,
+        block_resources: bool = True,
+        aggressive_block: bool = False,
+    ) -> Page:
         page = await context.new_page()
         if _stealth_async:
             await _stealth_async(page)
         if block_resources:
-            await self._setup_resource_blocking(page)
+            await self._setup_resource_blocking(page, aggressive=aggressive_block)
         return page
 
-    async def _setup_resource_blocking(self, page: Page):
+    async def _setup_resource_blocking(self, page: Page, aggressive: bool = False):
         BLOCKED_EXTENSIONS = (
             ".png", ".jpg", ".jpeg", ".gif", ".webp",
-            ".mp4", ".webm", ".ogg", ".mp3",
+            ".mp4", ".webm", ".ogg", ".mp3", ".woff", ".woff2", ".ttf",
         )
         BLOCKED_HOSTS = (
             "google-analytics.com", "googletagmanager.com",
@@ -305,6 +330,9 @@ class BrowserManager:
             "ads-twitter.com",
         )
         ALLOWED_TYPES = {"document", "script", "xhr", "fetch", "stylesheet", "websocket"}
+        # In aggressive mode (2GB VPS), also drop fonts and non-essential stylesheets
+        if aggressive:
+            ALLOWED_TYPES = {"document", "script", "xhr", "fetch", "websocket"}
 
         async def handle_route(route):
             req = route.request
@@ -322,7 +350,7 @@ class BrowserManager:
                 await route.abort()
                 return
 
-            if rt in ("image", "media", "other"):
+            if rt in ("image", "media", "font", "other"):
                 await route.abort()
                 return
 
