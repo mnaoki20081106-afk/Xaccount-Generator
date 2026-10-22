@@ -398,6 +398,97 @@ class XApiClient:
             return False
 
     # ────────────────────────────────────────────
+    # リツイート
+    # ────────────────────────────────────────────
+
+    async def retweet(self, tweet_id: str) -> bool:
+        try:
+            await self._post(
+                f"{_BASE}/1.1/statuses/retweet/{tweet_id}.json",
+                data={"id": tweet_id},
+            )
+            return True
+        except XDuplicateTweet:
+            return True  # already retweeted
+        except XAccountSuspended:
+            logger.error("[XApi] account suspended")
+            return False
+        except XRateLimited as e:
+            logger.warning(f"[XApi] retweet: rate limited, reset={e.reset_at}")
+            return False
+        except Exception as e:
+            logger.debug(f"[XApi] retweet error: {e}")
+            return False
+
+    async def get_retweetable_id(self) -> Optional[str]:
+        """タイムラインからリツイート/引用に使えるツイート ID を 1 件返す。"""
+        ids = await self.home_timeline(count=20)
+        if not ids:
+            return None
+        random.shuffle(ids)
+        return ids[0]
+
+    # ────────────────────────────────────────────
+    # 引用ツイート
+    # ────────────────────────────────────────────
+
+    async def quote_tweet(self, tweet_id: str, comment: str) -> bool:
+        """ツイートを引用ツイートする。"""
+        try:
+            # X internal GraphQL で引用ツイート
+            # v1.1 では attachment_url で tweet_id を指定する
+            url_attachment = f"https://twitter.com/i/web/status/{tweet_id}"
+            await self._post(
+                f"{_BASE}/1.1/statuses/update.json",
+                data={
+                    "status": comment,
+                    "attachment_url": url_attachment,
+                    "tweet_mode": "extended",
+                },
+            )
+            return True
+        except XDuplicateTweet:
+            logger.warning("[XApi] duplicate quote tweet")
+            return False
+        except XAccountSuspended:
+            logger.error("[XApi] account suspended")
+            return False
+        except XRateLimited as e:
+            logger.warning(f"[XApi] quote_tweet: rate limited, reset={e.reset_at}")
+            return False
+        except Exception as e:
+            logger.debug(f"[XApi] quote_tweet error: {e}")
+            return False
+
+    # ────────────────────────────────────────────
+    # 検索ブラウズ（ウォームアップ用）
+    # ────────────────────────────────────────────
+
+    async def search_browse(self, query: str, count: int = 10) -> bool:
+        """
+        検索クエリを実行してタイムラインを「見た」シグナルを送る。
+        いいねなし — 純粋なブラウズ。
+        """
+        try:
+            await self._get(
+                f"{_BASE}/2/search/adaptive.json",
+                params={
+                    "q": query,
+                    "count": count,
+                    "result_filter": "live",
+                    "tweet_search_mode": "live",
+                },
+            )
+            await asyncio.sleep(random.uniform(3.0, 8.0))
+            return True
+        except XRateLimited as e:
+            logger.warning(f"[XApi] search_browse: rate limited, reset={e.reset_at}")
+            return False
+        except Exception as e:
+            logger.debug(f"[XApi] search_browse error: {e}")
+            return False
+
+    # ────────────────────────────────────────────
     # ブラウズ（タイムライン取得のみ、何もしない）
     # ────────────────────────────────────────────
 

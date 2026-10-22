@@ -22,7 +22,7 @@ from .actions.tweet import TweetAction
 from .actions.follow import FollowAction
 from .actions.like import LikeAction
 from .warmup import WarmupScheduler
-from .detector import ShadowbanDetector, ShadowbanResolver
+from .detector import ShadowbanDetector, ShadowbanResolver, SearchTopChecker
 
 
 class _RateLimiter:
@@ -76,6 +76,7 @@ class Orchestrator:
         self.resolver = ShadowbanResolver(
             self.browser, self.login_action, self.tweet_action, self.like_action
         )
+        self.search_top_checker = SearchTopChecker()
         self.warmup = WarmupScheduler(
             config.warmup,
             self.browser,
@@ -172,12 +173,24 @@ class Orchestrator:
     async def run_shadowban_check(self, concurrency: int = 10):
         """
         全垢を検査し、バン状態を更新。解除アクションも自動実行。
+        HARD_SHADOW の垢は 6 時間以上経過後のみ再チェック（連続叩き防止）。
         """
+        from datetime import timedelta, timezone as tz
         accounts = await self.db.list_accounts()
+        now = datetime.now(tz.utc)
         sem = asyncio.Semaphore(concurrency)
 
         async def _check_one(account: Account):
             async with sem:
+                # HARD_SHADOW は最終アクションから 6h 以上経過していないとスキップ
+                if account.status == AccountStatus.HARD_SHADOW and account.last_action_at:
+                    last = account.last_action_at
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=tz.utc)
+                    if (now - last).total_seconds() < 6 * 3600:
+                        logger.debug(f"[@{account.username}] HARD_SHADOW cooling, skip check")
+                        return
+
                 ban_status = await self.detector.check(account.username)
                 await self.db.update_shadow_score(account.id, ban_status.shadow_score)
                 new_status = ban_status.status
@@ -190,9 +203,50 @@ class Orchestrator:
                     proxy = self.proxy_manager.get_proxy_for_account(account.username)
                     await self.resolver.resolve(account, ban_status, proxy_url=proxy.url)
 
-                await asyncio.sleep(random.uniform(2.0, 5.0))
+                # CLEAN に戻ったら検索TOP確認
+                elif new_status == AccountStatus.CLEAN and account.status != AccountStatus.CLEAN:
+                    await asyncio.sleep(random.uniform(3, 8))
+                    top = await self.search_top_checker.check(account.username)
+                    if not top.is_visible:
+                        logger.warning(
+                            f"[@{account.username}] ban score clean but search top not visible "
+                            f"(live={top.appears_in_live_search} typeahead={top.appears_in_typeahead})"
+                        )
+
+                await asyncio.sleep(random.uniform(2.0, 6.0))
 
         tasks = [_check_one(a) for a in accounts]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def run_search_top_check(self, concurrency: int = 8):
+        """
+        CLEAN / WARMING 垢を対象に検索TOP可視性を確認。
+        visibility_score < 0.6 の場合は soft_shadow 相当の回復を実行。
+        """
+        accounts = await self.db.list_accounts()
+        targets = [
+            a for a in accounts
+            if a.status in (AccountStatus.CLEAN, AccountStatus.WARMING)
+        ]
+        logger.info(f"Search top check: {len(targets)} accounts")
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _check_one(account: Account):
+            async with sem:
+                result = await self.search_top_checker.check(account.username)
+                if result.visibility_score < 0.6:
+                    logger.warning(
+                        f"[@{account.username}] low search visibility={result.visibility_score:.2f}, "
+                        f"triggering light recovery"
+                    )
+                    # BanStatus ダミーで soft ban 相当の回復
+                    from .detector import BanStatus
+                    soft = BanStatus(search_ban=True, source="search_top_check")
+                    proxy = self.proxy_manager.get_proxy_for_account(account.username)
+                    await self.resolver.resolve(account, soft, proxy_url=proxy.url)
+                await asyncio.sleep(random.uniform(1.5, 4.0))
+
+        tasks = [_check_one(a) for a in targets]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     # ──────────────────────────────────────────
@@ -210,26 +264,35 @@ class Orchestrator:
         永続ループ:
         1. 不足垢を補充
         2. ウォームアップ実行
-        3. シャドウバン確認
-        4. 次のサイクルまで待機
+        3. シャドウバン確認（3ソース多数決）
+        4. 検索TOP可視性確認（CLEAN 垢のみ）
+        5. 次のサイクルまで待機
         """
         logger.info(f"run_forever: target={target_count}, check_interval={check_interval_hours}h")
+        cycle = 0
 
         while True:
             try:
+                cycle += 1
+                logger.info(f"=== Cycle #{cycle} start ===")
+
                 # 1. 補充
                 await self.generate_accounts(target_count, concurrency=generation_concurrency)
 
                 # 2. ウォームアップ
                 await self.run_warmup_cycle(concurrency=warmup_concurrency)
 
-                # 3. シャドウバン確認（6時間に1回）
+                # 3. シャドウバン確認
                 await self.run_shadowban_check()
 
-                # 4. 待機
+                # 4. 検索TOP確認（2サイクルに1回）
+                if cycle % 2 == 0:
+                    await self.run_search_top_check()
+
+                # 5. 待機
                 wait = check_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
-                logger.info(f"Cycle done, sleeping {(wait + jitter) / 3600:.1f}h")
+                logger.info(f"=== Cycle #{cycle} done, sleeping {(wait + jitter) / 3600:.1f}h ===")
                 await asyncio.sleep(wait + jitter)
 
             except asyncio.CancelledError:
