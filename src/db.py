@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS action_log (
     created_at TEXT NOT NULL,
     FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS account_spending (
+    account_id  INTEGER PRIMARY KEY REFERENCES accounts(id),
+    sms_usd     REAL NOT NULL DEFAULT 0.0,
+    proxy_usd   REAL NOT NULL DEFAULT 0.0,
+    captcha_usd REAL NOT NULL DEFAULT 0.0,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

@@ -104,6 +104,8 @@ class AccountFactory:
         proxy_manager: ProxyManager,
         twofa_manager: TwoFAManager,
         browser_manager: BrowserManager,
+        ledger=None,
+        cost_guard=None,
     ):
         self.config = config
         self.proxy_manager = proxy_manager
@@ -111,6 +113,8 @@ class AccountFactory:
         self.browser = browser_manager
         self._captcha_client = None
         self._sms_mgr = None
+        self._ledger = ledger      # SpendingLedger | None
+        self._cost_guard = cost_guard  # CostGuard | None
         self._init_clients()
 
     def _init_clients(self):
@@ -179,6 +183,15 @@ class AccountFactory:
     # ────────────────────────────────────────────────
 
     async def create_one(self) -> Account | None:
+        # コスト上限チェック（$0.80 超えなら CostLimitExceeded が raise される）
+        if self._cost_guard:
+            from ..billing import CostLimitExceeded
+            try:
+                await self._cost_guard.check()
+            except CostLimitExceeded as e:
+                logger.error(str(e))
+                return None
+
         username = _gen_username()
         password = _gen_password()
         display_name = _gen_display_name()

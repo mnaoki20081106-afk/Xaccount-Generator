@@ -72,6 +72,15 @@ class WarmupConfig(BaseModel):
     actions_per_day_soft: int = 8
 
 
+class BillingConfig(BaseModel):
+    target_cost_per_account: float = 0.46  # 目標単価。超えたら警告
+    max_cost_per_account: float = 0.80     # 上限単価。超えたら生成停止
+    low_balance_alert_usd: float = 5.00    # サービス残高がこれを下回ったらアラート
+    proxy_cheap_api_key: str = ""          # proxy-cheap.com の API キー
+    proxy_cheap_ltc_address: str = ""      # proxy-cheap.com ダッシュボード → Billing → LTC
+    sms_ltc_address: str = ""             # 5sim.net ダッシュボード → Finance → LTC deposit
+
+
 class AppConfig(BaseModel):
     proxy: ProxyConfig
     browser: BrowserConfig = BrowserConfig()
@@ -83,6 +92,7 @@ class AppConfig(BaseModel):
     db: DBConfig = DBConfig()
     logging: LoggingConfig = LoggingConfig()
     warmup: WarmupConfig = WarmupConfig()
+    billing: BillingConfig = BillingConfig()
 
 
 def load_config(path: str | Path = "config.yaml") -> AppConfig:

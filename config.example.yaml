@@ -81,3 +81,22 @@ logging:
 warmup:
   min_days_before_sale: 21    # HStoraレベル: 21日以上
   actions_per_day_soft: 8
+
+billing:
+  # 目標単価: この金額を超えると WARNING ログを出す
+  target_cost_per_account: 0.46
+  # 上限単価: rolling avg がこれを超えると生成を自動停止 (1時間後に再試行)
+  max_cost_per_account: 0.80
+  # この残高を下回ったら Exodus から LTC を送るようにアラートを出す
+  low_balance_alert_usd: 5.00
+
+  # proxy-cheap.com — LTC で事前チャージして API キーを発行
+  # ダッシュボード: https://app.proxy-cheap.com/
+  proxy_cheap_api_key: "YOUR_PROXYCHEAP_KEY"
+  # LTC 入金アドレス: proxy-cheap.com → Billing → Add Funds → Cryptocurrency → LTC
+  proxy_cheap_ltc_address: ""
+
+  # 5sim.net — LTC で事前チャージ
+  # ダッシュボード: https://5sim.net/settings/profile で API キー取得
+  # LTC 入金アドレス: 5sim.net → Finance → Deposit → Cryptocurrency → LTC
+  sms_ltc_address: ""

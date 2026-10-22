@@ -23,6 +23,7 @@ from .actions.follow import FollowAction
 from .actions.like import LikeAction
 from .warmup import WarmupScheduler
 from .detector import ShadowbanDetector, ShadowbanResolver, SearchTopChecker
+from .billing import SpendingLedger, CostGuard, CostLimitExceeded, BalanceMonitor
 
 
 def _account_age_days(account: Account, now: datetime) -> int:
@@ -76,11 +77,20 @@ class Orchestrator:
         self.follow_action = FollowAction(self.browser)
         self.like_action = LikeAction(self.browser)
 
+        self.ledger = SpendingLedger(self.db)
+        self.cost_guard = CostGuard(
+            self.ledger,
+            target_usd=config.billing.target_cost_per_account,
+            max_usd=config.billing.max_cost_per_account,
+        )
+        self.balance_monitor = BalanceMonitor(config)
         self.factory = AccountFactory(
             config,
             self.proxy_manager,
             self.twofa_manager,
             self.browser,
+            ledger=self.ledger,
+            cost_guard=self.cost_guard,
         )
         self.detector = ShadowbanDetector(self.browser)
         self.resolver = ShadowbanResolver(
@@ -139,6 +149,14 @@ class Orchestrator:
                 if account:
                     aid = await self.db.add_account(account)
                     logger.success(f"Created account id={aid} @{account.username}")
+                    # コスト記録（SMS が支出の大半を占める）
+                    cfg = self.config.billing
+                    await self.ledger.record(
+                        aid,
+                        sms_usd=cfg.target_cost_per_account * 0.87,
+                        proxy_usd=cfg.target_cost_per_account * 0.02,
+                        captcha_usd=cfg.target_cost_per_account * 0.01,
+                    )
                 else:
                     logger.warning("Account creation failed, will retry next cycle")
 
@@ -369,7 +387,7 @@ class Orchestrator:
                 cycle += 1
                 logger.info(f"=== Cycle #{cycle} start ===")
 
-                # 1. 補充
+                # 1. 補充（CostGuard が $0.80 超えなら generate_accounts 内でスキップ）
                 await self.generate_accounts(target_count, concurrency=generation_concurrency)
 
                 # 2. ウォームアップ
@@ -385,7 +403,14 @@ class Orchestrator:
                 if cycle % 2 == 0:
                     await self.run_search_top_check()
 
-                # 6. 待機
+                # 6. コスト単価レポート（毎サイクル）
+                logger.info(await self.cost_guard.report())
+
+                # 7. 残高確認 + Exodus アラート（4サイクルに1回）
+                if cycle % 4 == 0:
+                    await self.balance_monitor.check_all()
+
+                # 8. 待機
                 wait = check_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
                 logger.info(f"=== Cycle #{cycle} done, sleeping {(wait + jitter) / 3600:.1f}h ===")
@@ -394,6 +419,9 @@ class Orchestrator:
             except asyncio.CancelledError:
                 logger.info("Orchestrator loop cancelled")
                 break
+            except CostLimitExceeded as e:
+                logger.error(f"[billing] {e} — 1時間後に再試行します")
+                await asyncio.sleep(3600)
             except Exception as e:
                 logger.exception(f"Orchestrator loop error: {e}")
                 await asyncio.sleep(60)
