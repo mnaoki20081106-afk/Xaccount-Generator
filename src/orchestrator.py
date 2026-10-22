@@ -5,7 +5,7 @@
 import asyncio
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone as _tz
 from typing import Optional
 from loguru import logger
 
@@ -23,6 +23,16 @@ from .actions.follow import FollowAction
 from .actions.like import LikeAction
 from .warmup import WarmupScheduler
 from .detector import ShadowbanDetector, ShadowbanResolver, SearchTopChecker
+
+
+def _account_age_days(account: Account, now: datetime) -> int:
+    """アカウントの垢齢（日数）を返す。timezone-aware に正規化して計算。"""
+    ca = account.created_at
+    if ca.tzinfo is None:
+        ca = ca.replace(tzinfo=_tz.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_tz.utc)
+    return max(0, (now - ca).days)
 
 
 class _RateLimiter:
@@ -175,9 +185,8 @@ class Orchestrator:
         全垢を検査し、バン状態を更新。解除アクションも自動実行。
         HARD_SHADOW の垢は 6 時間以上経過後のみ再チェック（連続叩き防止）。
         """
-        from datetime import timedelta, timezone as tz
         accounts = await self.db.list_accounts()
-        now = datetime.now(tz.utc)
+        now = datetime.now(_tz.utc)
         sem = asyncio.Semaphore(concurrency)
 
         async def _check_one(account: Account):
@@ -186,7 +195,7 @@ class Orchestrator:
                 if account.status == AccountStatus.HARD_SHADOW and account.last_action_at:
                     last = account.last_action_at
                     if last.tzinfo is None:
-                        last = last.replace(tzinfo=tz.utc)
+                        last = last.replace(tzinfo=_tz.utc)
                     if (now - last).total_seconds() < 6 * 3600:
                         logger.debug(f"[@{account.username}] HARD_SHADOW cooling, skip check")
                         return
@@ -239,7 +248,6 @@ class Orchestrator:
                         f"[@{account.username}] low search visibility={result.visibility_score:.2f}, "
                         f"triggering light recovery"
                     )
-                    # BanStatus ダミーで soft ban 相当の回復
                     from .detector import BanStatus
                     soft = BanStatus(search_ban=True, source="search_top_check")
                     proxy = self.proxy_manager.get_proxy_for_account(account.username)
@@ -247,6 +255,90 @@ class Orchestrator:
                 await asyncio.sleep(random.uniform(1.5, 4.0))
 
         tasks = [_check_one(a) for a in targets]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ──────────────────────────────────────────
+    # 卒業チェック（21日 → CLEAN = 販売可能）
+    # ──────────────────────────────────────────
+
+    async def run_graduation_check(self, concurrency: int = 5):
+        """
+        min_days_before_sale 日以上経過した WARMING 垢に卒業試験を実施。
+
+        合格条件:
+          1. shadowban スコア 0（3ソース全てクリーン）
+          2. 検索TOP可視性スコア ≥ 0.6（live search OR typeahead 通過）
+
+        合格 → AccountStatus.CLEAN（販売可能）
+        不合格 → WARMING のまま + 回復アクション → 次サイクルで再試験
+        """
+        from .detector import BanStatus as _BS
+
+        accounts = await self.db.list_accounts()
+        now = datetime.now(_tz.utc)
+        min_days = self.config.warmup.min_days_before_sale
+
+        candidates = [
+            a for a in accounts
+            if a.status == AccountStatus.WARMING
+            and _account_age_days(a, now) >= min_days
+        ]
+
+        if not candidates:
+            logger.info("Graduation check: no candidates")
+            return
+
+        logger.info(
+            f"Graduation check: {len(candidates)} candidates "
+            f"(≥{min_days}d old, still WARMING)"
+        )
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _graduate(account: Account):
+            async with sem:
+                age = _account_age_days(account, now)
+                proxy = self.proxy_manager.get_proxy_for_account(account.username)
+
+                # ── ステップ1: shadowban チェック ────────────────
+                ban = await self.detector.check(account.username)
+                await self.db.update_shadow_score(account.id, ban.shadow_score)
+
+                if not ban.is_clean:
+                    logger.info(
+                        f"[@{account.username}] graduation FAIL: "
+                        f"shadowban score={ban.shadow_score:.2f} age={age}d — recovery triggered"
+                    )
+                    await self.db.update_status(account.id, ban.status)
+                    await self.resolver.resolve(account, ban, proxy_url=proxy.url)
+                    return
+
+                # ── ステップ2: 検索TOP可視性チェック ─────────────
+                await asyncio.sleep(random.uniform(3, 8))
+                top = await self.search_top_checker.check(account.username)
+
+                if top.visibility_score < 0.6:
+                    logger.warning(
+                        f"[@{account.username}] graduation FAIL: "
+                        f"search visibility={top.visibility_score:.2f} age={age}d "
+                        f"(live={top.appears_in_live_search} typeahead={top.appears_in_typeahead}) "
+                        f"— light recovery triggered"
+                    )
+                    soft = _BS(search_ban=True, source="graduation_visibility_fail")
+                    await self.resolver.resolve(account, soft, proxy_url=proxy.url)
+                    return
+
+                # ── 合格: CLEAN に昇格 ────────────────────────────
+                await self.db.update_status(account.id, AccountStatus.CLEAN)
+                await self.db.update_shadow_score(account.id, 0.0)
+                logger.success(
+                    f"[@{account.username}] ★ GRADUATED → CLEAN (sale ready) "
+                    f"age={age}d "
+                    f"visibility={top.visibility_score:.2f} "
+                    f"live={top.appears_in_live_search} typeahead={top.appears_in_typeahead}"
+                )
+                await asyncio.sleep(random.uniform(2, 5))
+
+        tasks = [_graduate(a) for a in candidates]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     # ──────────────────────────────────────────
@@ -265,8 +357,9 @@ class Orchestrator:
         1. 不足垢を補充
         2. ウォームアップ実行
         3. シャドウバン確認（3ソース多数決）
-        4. 検索TOP可視性確認（CLEAN 垢のみ）
-        5. 次のサイクルまで待機
+        4. 卒業チェック（21日経過 WARMING → CLEAN）
+        5. 検索TOP可視性確認（CLEAN 垢 / 2サイクルに1回）
+        6. 次のサイクルまで待機
         """
         logger.info(f"run_forever: target={target_count}, check_interval={check_interval_hours}h")
         cycle = 0
@@ -285,11 +378,14 @@ class Orchestrator:
                 # 3. シャドウバン確認
                 await self.run_shadowban_check()
 
-                # 4. 検索TOP確認（2サイクルに1回）
+                # 4. 卒業チェック（毎サイクル）
+                await self.run_graduation_check()
+
+                # 5. 検索TOP確認（2サイクルに1回）
                 if cycle % 2 == 0:
                     await self.run_search_top_check()
 
-                # 5. 待機
+                # 6. 待機
                 wait = check_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
                 logger.info(f"=== Cycle #{cycle} done, sleeping {(wait + jitter) / 3600:.1f}h ===")
