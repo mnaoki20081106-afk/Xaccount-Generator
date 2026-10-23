@@ -166,6 +166,7 @@ class ProxyManager:
     def _load_state(self):
         if STATE_FILE.exists():
             try:
+                self._state_mtime = STATE_FILE.stat().st_mtime_ns
                 raw = json.loads(STATE_FILE.read_text())
                 self._sessions = raw.get("sessions", {})
                 self._account_map = raw.get("account_map", {})
@@ -173,6 +174,17 @@ class ProxyManager:
                 logger.debug(f"Proxy state loaded: {len(self._sessions)} sessions")
             except Exception as e:
                 logger.warning(f"proxy state load error: {e}")
+
+    def refresh(self):
+        """状態ファイルが別プロセス（run デーモンなど）に更新されていたら読み直す。
+        APIサーバーとデーモンは別プロセスで同じファイルを共有するため、操作や
+        表示の前に呼んで古い状態で上書き・表示するのを避ける。"""
+        try:
+            mtime = STATE_FILE.stat().st_mtime_ns
+        except OSError:
+            return
+        if mtime != getattr(self, "_state_mtime", None):
+            self._load_state()
 
     def _save_state(self):
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +199,10 @@ class ProxyManager:
                 ensure_ascii=False,
             )
         )
+        try:
+            self._state_mtime = STATE_FILE.stat().st_mtime_ns
+        except OSError:
+            pass
 
     def _session_obj(self, session_id: str) -> ProxySession:
         return ProxySession(self._sessions[session_id], self.config)
@@ -196,6 +212,7 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_proxy_for_account(self, account_key: str) -> ProxySession:
+        self.refresh()
         if account_key in self._account_map:
             sid = self._account_map[account_key]
             if sid in self._sessions:
@@ -244,6 +261,7 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_warmup_proxy(self, account_key: str) -> ProxySession:
+        self.refresh()
         # Reuse the creation session — same IP = consistent fingerprint chain
         sid = self._account_map.get(account_key)
         if sid and sid in self._sessions:
@@ -334,6 +352,7 @@ class ProxyManager:
 
     def sessions_report(self) -> list[dict]:
         """全セッションの状態一覧。状態の自動リセットなど副作用は起こさない。"""
+        self.refresh()
         now = datetime.now(timezone.utc)
         max_per_ip = self.config.max_accounts_per_ip
         assigned: dict[str, int] = {}
@@ -373,6 +392,7 @@ class ProxyManager:
     def reset_session(self, session_id: str, *, circuit: bool = True, cooldown: bool = False) -> bool:
         """サーキットブレーカー／クーリングを解除する。cooldown=Trueは
         3週間の再利用待ちを飛ばして、割当数も0に戻す（運用者が明示した場合のみ）。"""
+        self.refresh()
         d = self._sessions.get(session_id)
         if d is None:
             return False
@@ -389,6 +409,7 @@ class ProxyManager:
 
     def remove_session(self, session_id: str) -> str:
         """未使用のセッションだけ削除する。垢が紐付いているものは削除しない。"""
+        self.refresh()
         if session_id not in self._sessions:
             return "not_found"
         in_use = (
@@ -403,6 +424,7 @@ class ProxyManager:
         return "removed"
 
     def status_report(self) -> dict:
+        self.refresh()
         total = len(self._sessions)
         cooling = sum(
             1 for d in self._sessions.values()

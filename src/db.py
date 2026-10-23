@@ -39,6 +39,35 @@ CREATE TABLE IF NOT EXISTS proxy_blacklist (
     expire_at TEXT
 );
 
+-- 支払い台帳（プロキシ通信量のチャージ・SMS・Captcha等）。金額は円換算して保存する。
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    amount_jpy REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'JPY',
+    amount_original REAL NOT NULL,
+    rate_to_jpy REAL NOT NULL DEFAULT 1,
+    quantity REAL,
+    unit TEXT,
+    paid_at TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_paid_at ON expenses(paid_at);
+
+-- VPS契約（サーバーは1つなので1行だけ）
+CREATE TABLE IF NOT EXISTS vps_contract (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    label TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    monthly_fee_jpy REAL NOT NULL DEFAULT 0,
+    billing_day INTEGER,
+    started_at TEXT,
+    note TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS action_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL,
@@ -200,6 +229,82 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ── コスト（支払い台帳・VPS契約） ──
+
+    async def add_expense(
+        self, *, category: str, description: str, amount_jpy: float, currency: str,
+        amount_original: float, rate_to_jpy: float, quantity: Optional[float],
+        unit: Optional[str], paid_at: str, note: Optional[str],
+    ) -> int:
+        cursor = await self.conn.execute(
+            """
+            INSERT INTO expenses (category, description, amount_jpy, currency, amount_original,
+                                  rate_to_jpy, quantity, unit, paid_at, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (category, description, amount_jpy, currency, amount_original, rate_to_jpy,
+             quantity, unit, paid_at, note, datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid
+
+    async def list_expenses(self, since: Optional[str] = None, limit: int = 500) -> List[dict]:
+        sql = "SELECT * FROM expenses"
+        params: list = []
+        if since:
+            sql += " WHERE paid_at >= ?"
+            params.append(since)
+        sql += " ORDER BY paid_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await (await self.conn.execute(sql, params)).fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_expense(self, expense_id: int) -> bool:
+        cursor = await self.conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        await self.conn.commit()
+        return cursor.rowcount > 0
+
+    async def account_status_counts(self, since_iso: Optional[str] = None) -> dict:
+        """作成日時が since 以降の垢のステータス別件数（None なら全期間）。"""
+        sql = "SELECT status, COUNT(*) AS n FROM accounts"
+        params: list = []
+        if since_iso:
+            sql += " WHERE created_at >= ?"
+            params.append(since_iso)
+        sql += " GROUP BY status"
+        rows = await (await self.conn.execute(sql, params)).fetchall()
+        return {r["status"]: r["n"] for r in rows}
+
+    async def first_account_created_at(self) -> Optional[str]:
+        row = await (await self.conn.execute("SELECT MIN(created_at) AS t FROM accounts")).fetchone()
+        return row["t"] if row else None
+
+    async def first_expense_paid_at(self) -> Optional[str]:
+        row = await (await self.conn.execute("SELECT MIN(paid_at) AS t FROM expenses")).fetchone()
+        return row["t"] if row else None
+
+    async def get_vps_contract(self) -> Optional[dict]:
+        row = await (await self.conn.execute("SELECT * FROM vps_contract WHERE id = 1")).fetchone()
+        return dict(row) if row else None
+
+    async def save_vps_contract(
+        self, *, label: str, provider: str, monthly_fee_jpy: float,
+        billing_day: Optional[int], started_at: Optional[str], note: Optional[str],
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO vps_contract (id, label, provider, monthly_fee_jpy, billing_day, started_at, note, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                label = excluded.label, provider = excluded.provider,
+                monthly_fee_jpy = excluded.monthly_fee_jpy, billing_day = excluded.billing_day,
+                started_at = excluded.started_at, note = excluded.note, updated_at = excluded.updated_at
+            """,
+            (label, provider, monthly_fee_jpy, billing_day, started_at, note,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
 
     async def get_account_by_id(self, account_id: int) -> Optional[Account]:
         cursor = await self.conn.execute(

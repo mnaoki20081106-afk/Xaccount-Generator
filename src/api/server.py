@@ -21,6 +21,7 @@ import re
 import shutil
 import sys
 import time
+from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -29,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from .. import costs
 from ..config import load_config, AppConfig
 from ..db import Database
 from ..models import AccountStatus
@@ -295,12 +297,16 @@ async def start_generation(request: Request, body_model: GenerateRequest):
         _state._orchestrator_target = body_model.count
         _state._orchestrator_started_at = time.time()
         orc = Orchestrator(_state.config, proxy_manager=_state.proxy_manager)
-        await orc.start()
         try:
+            # start() もtryの内側に置く。停止要求(cancel)が起動中に届いても
+            # 実行中フラグを必ず戻すため。
+            await orc.start()
             await orc.generate_accounts(body_model.count, concurrency=body_model.concurrency)
         finally:
-            await orc.stop()
-            _state._orchestrator_running = False
+            try:
+                await orc.stop()
+            finally:
+                _state._orchestrator_running = False
 
     if _state._orchestrator_task and not _state._orchestrator_task.done():
         raise HTTPException(409, detail="ORCHESTRATOR_ALREADY_RUNNING")
@@ -516,3 +522,257 @@ async def get_server_info(request: Request):
         "log_size_bytes": _file_size(_state.config.logging.file),
         "orchestrator_running": _state._orchestrator_running,
     }
+
+
+# ─────────────────────────────────────────────
+# コスト（垢の単価）・支払い台帳・VPS契約
+# ─────────────────────────────────────────────
+
+def _cost_error(exc: costs.CostError) -> HTTPException:
+    return HTTPException(400, detail=str(exc))
+
+
+def _contract_view(contract: Optional[dict]) -> dict:
+    today = datetime.now(timezone.utc).date()
+    if not contract:
+        return {"configured": False, "label": "", "provider": "", "monthly_fee_jpy": 0,
+                "billing_day": None, "started_at": None, "note": None, "next_due": None}
+    return {
+        "configured": True,
+        "label": contract["label"],
+        "provider": contract["provider"],
+        "monthly_fee_jpy": contract["monthly_fee_jpy"],
+        "billing_day": contract["billing_day"],
+        "started_at": contract["started_at"],
+        "note": contract["note"],
+        "next_due": (
+            d.isoformat() if (d := costs.next_due_date(contract["billing_day"], today)) else None
+        ),
+    }
+
+
+async def _compute_costs() -> dict:
+    now = datetime.now(timezone.utc)
+    contract = await _state.db.get_vps_contract()
+    monthly = float(contract["monthly_fee_jpy"]) if contract else 0.0
+    contract_start = (
+        costs.parse_date(contract["started_at"]) if contract and contract.get("started_at") else None
+    )
+
+    first_account = await _state.db.first_account_created_at()
+    first_expense = await _state.db.first_expense_paid_at()
+    candidates = []
+    if first_account:
+        candidates.append(datetime.fromisoformat(first_account))
+    if first_expense:
+        d = costs.parse_date(first_expense)
+        candidates.append(datetime(d.year, d.month, d.day, tzinfo=timezone.utc))
+    if contract_start:
+        candidates.append(datetime(contract_start.year, contract_start.month, contract_start.day, tzinfo=timezone.utc))
+    candidates = [c if c.tzinfo else c.replace(tzinfo=timezone.utc) for c in candidates]
+    earliest = min(candidates) if candidates else None
+
+    windows = []
+    for spec in costs.WINDOWS:
+        if spec.days is not None:
+            since_dt = now - timedelta(days=spec.days)
+            since_iso = since_dt.isoformat()
+            since_date = since_dt.date().isoformat()
+        else:
+            since_iso = None
+            since_date = None
+        expenses = await _state.db.list_expenses(since=since_date, limit=100000)
+        counts = await _state.db.account_status_counts(since_iso)
+        windows.append(costs.compute_window(
+            spec, now=now, expenses=expenses, status_counts=counts,
+            monthly_fee_jpy=monthly, contract_start=contract_start, earliest=earliest,
+        ))
+
+    all_expenses = await _state.db.list_expenses(limit=100000)
+    proxy_rows = [e for e in all_expenses if e["category"] == "proxy"]
+    proxy_gb = sum(e["quantity"] for e in proxy_rows if e["quantity"] and (e["unit"] or "GB") == "GB")
+    proxy_gb_cost = sum(e["amount_jpy"] for e in proxy_rows if e["quantity"] and (e["unit"] or "GB") == "GB")
+    return {
+        "generated_at": now.isoformat(),
+        "windows": windows,
+        "proxy": {
+            "payments": len(proxy_rows),
+            "total_paid_jpy": round(sum(e["amount_jpy"] for e in proxy_rows), 2),
+            "total_gb": round(proxy_gb, 3),
+            "avg_jpy_per_gb": round(proxy_gb_cost / proxy_gb, 2) if proxy_gb > 0 else None,
+            "last_paid_at": proxy_rows[0]["paid_at"] if proxy_rows else None,
+        },
+        "vps": _contract_view(contract),
+    }
+
+
+@app.get("/api/generator/costs")
+async def get_costs(request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+    return await _compute_costs()
+
+
+@app.get("/api/generator/expenses")
+async def list_expenses(request: Request, limit: int = 200):
+    body = await request.body()
+    await _verify_request(request, body)
+    return {"expenses": await _state.db.list_expenses(limit=max(1, min(limit, 1000)))}
+
+
+class ExpenseRequest(BaseModel):
+    category: str
+    description: str = ""
+    amount: float
+    currency: str = "JPY"
+    rate_to_jpy: Optional[float] = None
+    quantity: Optional[float] = None
+    unit: Optional[str] = None
+    paid_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.post("/api/generator/expenses")
+async def add_expense(request: Request):
+    raw_body = await request.body()
+    await _verify_request(request, raw_body)
+    try:
+        data = ExpenseRequest.model_validate_json(raw_body or b"{}")
+    except ValueError:
+        raise HTTPException(400, detail="INVALID_BODY")
+
+    try:
+        if data.category not in costs.CATEGORIES:
+            raise costs.CostError("種類が不正です（" + " / ".join(costs.CATEGORIES) + "）")
+        amount_jpy = costs.to_jpy(data.amount, data.currency, data.rate_to_jpy)
+        paid = costs.parse_date(data.paid_at, "支払日") if data.paid_at else datetime.now(timezone.utc).date()
+        if paid > datetime.now(timezone.utc).date() + timedelta(days=1):
+            raise costs.CostError("支払日に未来の日付は指定できません")
+        if data.quantity is not None and not (0 < data.quantity <= 1_000_000):
+            raise costs.CostError("数量は0より大きい値で指定してください")
+        description = data.description.strip()[:200]
+        note = (data.note or "").strip()[:500] or None
+    except costs.CostError as exc:
+        raise _cost_error(exc)
+
+    currency = (data.currency or "JPY").strip().upper()
+    expense_id = await _state.db.add_expense(
+        category=data.category, description=description, amount_jpy=amount_jpy,
+        currency=currency, amount_original=data.amount,
+        rate_to_jpy=1.0 if currency == "JPY" else float(data.rate_to_jpy),
+        quantity=data.quantity, unit=(data.unit or ("GB" if data.category == "proxy" else None)),
+        paid_at=paid.isoformat(), note=note,
+    )
+    return {"ok": True, "id": expense_id, "amount_jpy": amount_jpy}
+
+
+@app.delete("/api/generator/expenses/{expense_id}")
+async def delete_expense(expense_id: int, request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+    if not await _state.db.delete_expense(expense_id):
+        raise HTTPException(404, detail="EXPENSE_NOT_FOUND")
+    return {"ok": True}
+
+
+@app.get("/api/generator/vps-contract")
+async def get_vps_contract(request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+    return _contract_view(await _state.db.get_vps_contract())
+
+
+class VpsContractRequest(BaseModel):
+    label: str = ""
+    provider: str = ""
+    monthly_fee_jpy: float = 0
+    billing_day: Optional[int] = None
+    started_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.put("/api/generator/vps-contract")
+async def save_vps_contract(request: Request):
+    raw_body = await request.body()
+    await _verify_request(request, raw_body)
+    try:
+        data = VpsContractRequest.model_validate_json(raw_body or b"{}")
+    except ValueError:
+        raise HTTPException(400, detail="INVALID_BODY")
+    try:
+        if not (0 <= data.monthly_fee_jpy <= 10_000_000):
+            raise costs.CostError("月額は0〜1000万円で指定してください")
+        if data.billing_day is not None and not (1 <= data.billing_day <= 31):
+            raise costs.CostError("支払日は1〜31で指定してください")
+        started = costs.parse_date(data.started_at, "契約開始日").isoformat() if data.started_at else None
+    except costs.CostError as exc:
+        raise _cost_error(exc)
+    await _state.db.save_vps_contract(
+        label=data.label.strip()[:100], provider=data.provider.strip()[:100],
+        monthly_fee_jpy=data.monthly_fee_jpy, billing_day=data.billing_day,
+        started_at=started, note=(data.note or "").strip()[:500] or None,
+    )
+    return _contract_view(await _state.db.get_vps_contract())
+
+
+# ─────────────────────────────────────────────
+# ログ閲覧・生成ジョブの停止
+# ─────────────────────────────────────────────
+
+_LOG_REDACTIONS = (
+    # http://user:password@host → パスワードを隠す（プロキシURLなど）
+    (re.compile(r"(://[^:@/\s]+:)[^@/\s]+@"), r"\1***@"),
+    # key=value 形式の秘密情報
+    (re.compile(r"(?i)\b(password|passwd|secret|token|auth_token|ct0|api[_-]?key|twofa_secret|2fa)\b(\s*[=:]\s*)[^\s,;|\"']+"), r"\1\2***"),
+)
+_MAX_LOG_READ = 512 * 1024
+
+
+def _redact(line: str) -> str:
+    for pattern, replacement in _LOG_REDACTIONS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def _tail_lines(path: str, lines: int) -> Optional[list[str]]:
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - _MAX_LOG_READ))
+            data = fh.read()
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="replace").splitlines()
+    if size > _MAX_LOG_READ and text:
+        text = text[1:]  # 先頭は途中で切れている可能性がある
+    return text[-lines:]
+
+
+@app.get("/api/generator/logs")
+async def get_logs(request: Request, lines: int = 200, level: str = ""):
+    body = await request.body()
+    await _verify_request(request, body)
+
+    lines = max(1, min(lines, 500))
+    level = level.strip().upper()
+    if level and level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise HTTPException(400, detail="INVALID_LEVEL")
+    # 絞り込む場合は多めに読んでから絞る
+    raw = _tail_lines(_state.config.logging.file, lines if not level else 500)
+    if raw is None:
+        return {"available": False, "lines": []}
+    if level:
+        marker = re.compile(r"\|\s*" + level + r"\s*\|")
+        raw = [row for row in raw if marker.search(row)][-lines:]
+    return {"available": True, "lines": [_redact(row)[:600] for row in raw]}
+
+
+@app.post("/api/generator/generate/stop")
+async def stop_generation(request: Request):
+    raw_body = await request.body()
+    await _verify_request(request, raw_body)
+    task = _state._orchestrator_task
+    if not task or task.done():
+        raise HTTPException(409, detail="ORCHESTRATOR_NOT_RUNNING")
+    task.cancel()
+    return {"ok": True}
