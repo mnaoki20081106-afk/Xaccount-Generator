@@ -43,7 +43,7 @@ _BASE = "https://x.com/i/api"
 # curl_cffi の Chrome バージョン（api_flow.py と揃える）
 _IMPERSONATE = "chrome136"
 
-# chrome136 フィンガープリントに合わせた Chrome UA（Safari UA は JA3 不一致でボット検出される）
+# chrome136 フィンガープリントに合わせた Chrome UA
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
@@ -144,7 +144,6 @@ def _cookies(auth_token: str, ct0: str) -> dict:
 
 # ── ClientTransaction cache ──────────────────────────────────────────────────
 
-# Global per-proxy cache: proxy_url → ClientTransaction
 _transaction_cache: dict[str, ClientTransaction] = {}
 _transaction_lock = asyncio.Lock()
 
@@ -396,6 +395,38 @@ class XApiClient:
         except Exception as e:
             logger.debug(f"[XApi] tweet error: {e}")
             return False
+
+    async def tweet_returning_id(self, text: str) -> Optional[str]:
+        """ツイートを投稿し、ツイートIDを返す。失敗時はNone。"""
+        try:
+            body = await self._post(
+                f"{_BASE}/1.1/statuses/update.json",
+                data={"status": text, "tweet_mode": "extended"},
+            )
+            if isinstance(body, dict):
+                tid = str(body.get("id_str") or body.get("id") or "")
+                return tid if tid else None
+        except XDuplicateTweet:
+            logger.warning("[XApi] duplicate tweet")
+        except XAccountSuspended:
+            logger.error("[XApi] account suspended")
+        except XRateLimited as e:
+            logger.warning(f"[XApi] tweet: rate limited, reset={e.reset_at}")
+        except Exception as e:
+            logger.debug(f"[XApi] tweet_returning_id error: {e}")
+        return None
+
+    async def delete_tweet(self, tweet_id: str) -> bool:
+        """ツイートを削除する。"""
+        try:
+            await self._post(
+                f"{_BASE}/1.1/statuses/destroy/{tweet_id}.json",
+                data={"id": tweet_id, "trim_user": "true"},
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"[XApi] delete_tweet {tweet_id} error: {e}")
+        return False
 
     # ────────────────────────────────────────────
     # ブラウズ（タイムライン取得のみ、何もしない）

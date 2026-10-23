@@ -35,8 +35,6 @@ class CaptchaConfig(BaseModel):
     api_key: str = ""
     provider_fallback: str = ""          # プライマリが失敗した際のフォールバック
     api_key_fallback: str = ""
-    # CDS Solver (cds-solver.com) APIキー — Arkose 解決のフォールバック
-    # ローカル解決 (arkose_solver) が失敗した場合のみ使用
     cds_api_key: str = ""
 
 
@@ -70,6 +68,8 @@ class LoggingConfig(BaseModel):
 class WarmupConfig(BaseModel):
     min_days_before_sale: int = 21       # HStoraレベル: 21日以上
     actions_per_day_soft: int = 8
+    active_hours_utc: list[int] = list(range(0, 14))   # JST 09:00-22:59 (UTC 00:00-13:59)
+    graduation_min_active_days: int = 14               # ACTIVE フェーズ開始から何日でテスト対象にするか
 
 
 class AppConfig(BaseModel):

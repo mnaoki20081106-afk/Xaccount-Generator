@@ -4,6 +4,7 @@
 - 上限に達したら COOLDOWN_WEEKS 週間クーリング、その後リセットして再利用
 - セッション状態は data/proxy_sessions.json に永続保存
 - サーキットブレーカー: 連続失敗 CIRCUIT_THRESHOLD 回でセッション一時遮断
+- warmup_only フラグ: ウォームアップ専用セッションはサインアップに使わない
 """
 from __future__ import annotations
 
@@ -21,9 +22,8 @@ from ..config import ProxyConfig
 
 COOLDOWN_WEEKS = 3
 SIGNUP_INTERVAL_HOURS = 2
-# サーキットブレーカー設定
-CIRCUIT_THRESHOLD = 4       # 連続失敗でオープン
-CIRCUIT_RESET_MINUTES = 30  # オープン後この時間経過で半オープン→再試行
+CIRCUIT_THRESHOLD = 4
+CIRCUIT_RESET_MINUTES = 30
 
 STATE_FILE = Path("data/proxy_sessions.json")
 
@@ -68,6 +68,10 @@ class ProxySession:
     def cooldown_until(self) -> Optional[datetime]:
         return _parse_dt(self._d.get("cooldown_until"))
 
+    @property
+    def warmup_only(self) -> bool:
+        return bool(self._d.get("warmup_only", False))
+
     # ── サーキットブレーカー ──
     @property
     def consecutive_failures(self) -> int:
@@ -81,7 +85,6 @@ class ProxySession:
         until = self.circuit_open_until
         if until and datetime.now(timezone.utc) < until:
             return True
-        # 期限切れ → 自動リセット
         if until and datetime.now(timezone.utc) >= until:
             self._d["circuit_open_until"] = None
             self._d["consecutive_failures"] = 0
@@ -118,6 +121,8 @@ class ProxySession:
         return bool(cu and datetime.now(timezone.utc) < cu)
 
     def is_ready_for_signup(self, max_per_ip: int) -> bool:
+        if self.warmup_only:
+            return False
         if self.is_cooling():
             return False
         if self.is_circuit_open():
@@ -176,9 +181,7 @@ class ProxyManager:
                 logger.warning(f"proxy state load error: {e}")
 
     def refresh(self):
-        """状態ファイルが別プロセス（run デーモンなど）に更新されていたら読み直す。
-        APIサーバーとデーモンは別プロセスで同じファイルを共有するため、操作や
-        表示の前に呼んで古い状態で上書き・表示するのを避ける。"""
+        """状態ファイルが別プロセスに更新されていたら読み直す。"""
         try:
             mtime = STATE_FILE.stat().st_mtime_ns
         except OSError:
@@ -228,7 +231,7 @@ class ProxyManager:
             key=lambda x: x[1].get("last_signup_at") or "",
         ):
             sess = ProxySession(d, self.config)
-            if sess.is_ready_for_signup(max_per_ip):
+            if sess.is_ready_for_signup(max_per_ip):  # warmup_only 除外は is_ready_for_signup 内
                 sess.record_signup(max_per_ip)
                 self._account_map[account_key] = sid
                 self._save_state()
@@ -247,6 +250,7 @@ class ProxyManager:
             "consecutive_failures": 0,
             "circuit_open_until": None,
             "last_exit_ip": "",
+            "warmup_only": False,
         }
         self._sessions[sid] = new_d
         sess = ProxySession(new_d, self.config)
@@ -261,13 +265,16 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def get_warmup_proxy(self, account_key: str) -> ProxySession:
+        """ウォームアップ用プロキシを返す。
+        サインアップ時と同じスティッキーセッションを優先して再利用する。
+        """
         self.refresh()
-        # Reuse the creation session — same IP = consistent fingerprint chain
+        # 生成時のセッションを再利用 — 同一IPで連続性を保つ
         sid = self._account_map.get(account_key)
         if sid and sid in self._sessions:
             return ProxySession(self._sessions[sid], self.config)
 
-        # Fallback: warmup-dedicated session
+        # フォールバック: ウォームアップ専用セッション
         wu_sid = self._warmup_map.get(account_key)
         if not wu_sid:
             wu_sid = hashlib.md5(f"wu:{account_key}".encode()).hexdigest()[:8]
@@ -275,15 +282,45 @@ class ProxyManager:
         if wu_sid not in self._sessions:
             self._sessions[wu_sid] = {
                 "session_id": wu_sid,
-                "account_count": 1,
+                "account_count": 0,   # サインアップ用のカウンタに含めない
                 "last_signup_at": None,
                 "cooldown_until": None,
                 "consecutive_failures": 0,
                 "circuit_open_until": None,
                 "last_exit_ip": "",
+                "warmup_only": True,  # サインアップ候補から除外
             }
         self._save_state()
         return ProxySession(self._sessions[wu_sid], self.config)
+
+    async def get_warmup_proxy_verified(
+        self, account_key: str
+    ) -> tuple[ProxySession, bool]:
+        """
+        ウォームアップ用プロキシを取得し、ヘルスチェックで出口IPを確認する。
+        戻り値: (session, ip_consistent)
+          ip_consistent=True  — 出口IPがサインアップ時と一致（または初回で比較対象なし）
+          ip_consistent=False — IPが変化（スティッキーセッション期限切れ等）、続行はするがログ警告
+        """
+        sess = self.get_warmup_proxy(account_key)
+        previous_ip = sess._d.get("last_exit_ip") or ""
+
+        ok = await self.health_check(sess)
+        if not ok:
+            logger.warning(
+                f"[{account_key}] warmup proxy health check failed session={sess.session_id}"
+            )
+            return sess, False
+
+        current_ip = sess._d.get("last_exit_ip") or ""
+        if previous_ip and current_ip and previous_ip != current_ip:
+            logger.warning(
+                f"[{account_key}] warmup IP changed: {previous_ip} → {current_ip} "
+                f"(sticky session rotated — session={sess.session_id})"
+            )
+            return sess, False
+
+        return sess, True
 
     # ──────────────────────────────────────────
     # ヘルスチェック（サーキットブレーカー連携）
@@ -351,7 +388,7 @@ class ProxyManager:
     # ──────────────────────────────────────────
 
     def sessions_report(self) -> list[dict]:
-        """全セッションの状態一覧。状態の自動リセットなど副作用は起こさない。"""
+        """全セッションの状態一覧。副作用なし。"""
         self.refresh()
         now = datetime.now(timezone.utc)
         max_per_ip = self.config.max_accounts_per_ip
@@ -370,6 +407,8 @@ class ProxyManager:
                 state = "circuit_open"
             elif cooling:
                 state = "cooling"
+            elif sess.warmup_only:
+                state = "warmup_only"
             elif sess.account_count >= max_per_ip:
                 state = "full"
             else:
@@ -377,6 +416,7 @@ class ProxyManager:
             rows.append({
                 "session_id": sid,
                 "state": state,
+                "warmup_only": sess.warmup_only,
                 "account_count": sess.account_count,
                 "max_accounts": max_per_ip,
                 "assigned_accounts": assigned.get(sid, 0),
@@ -390,8 +430,6 @@ class ProxyManager:
         return rows
 
     def reset_session(self, session_id: str, *, circuit: bool = True, cooldown: bool = False) -> bool:
-        """サーキットブレーカー／クーリングを解除する。cooldown=Trueは
-        3週間の再利用待ちを飛ばして、割当数も0に戻す（運用者が明示した場合のみ）。"""
         self.refresh()
         d = self._sessions.get(session_id)
         if d is None:
@@ -434,10 +472,15 @@ class ProxyManager:
             1 for d in self._sessions.values()
             if ProxySession(d, self.config).is_circuit_open()
         )
-        ready = total - cooling - circuit_open
+        warmup_only = sum(
+            1 for d in self._sessions.values()
+            if d.get("warmup_only")
+        )
+        ready = total - cooling - circuit_open - warmup_only
         return {
             "total_sessions": total,
             "cooling": cooling,
             "circuit_open": circuit_open,
+            "warmup_only": warmup_only,
             "ready": max(ready, 0),
         }

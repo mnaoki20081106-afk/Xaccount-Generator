@@ -1,6 +1,6 @@
 """
 100垢を並列で管理するオーケストレーター。
-各アカウントのライフサイクル（生成→ウォームアップ→運用→バン解除）を制御する。
+各アカウントのライフサイクル（生成→ウォームアップ→卒業テスト→運用→バン解除）を制御する。
 """
 import asyncio
 import random
@@ -21,16 +21,14 @@ from .actions.login import LoginAction
 from .actions.tweet import TweetAction
 from .actions.follow import FollowAction
 from .actions.like import LikeAction
-from .warmup import WarmupScheduler
+from .warmup import WarmupScheduler, should_run_graduation
 from .detector import ShadowbanDetector, ShadowbanResolver
+from .detector.graduation import GraduationTest
 
 
 class _RateLimiter:
     """
     1時間あたり per_hour 回までという全体レートを concurrency に関係なく守る。
-    sem 配下で各タスクが個別に sleep するだけだと、concurrency 個が同時に
-    スリープ→同時に実行してしまい per_hour が無意味化するため、
-    ロックで「次に実行してよい時刻」を直列に予約してからスリープする。
     """
 
     def __init__(self, per_hour: float):
@@ -52,8 +50,6 @@ class Orchestrator:
     def __init__(self, config: AppConfig, proxy_manager: ProxyManager | None = None):
         self.config = config
         self.db = Database(config.db.path)
-        # APIサーバーと同じインスタンスを共有できる（別インスタンスだと
-        # proxy_sessions.json を互いに上書きしてしまうため）。
         self.proxy_manager = proxy_manager or ProxyManager(config.proxy)
         self.twofa_manager = TwoFAManager(config.twofa.encryption_key)
         self.browser = BrowserManager(
@@ -87,11 +83,10 @@ class Orchestrator:
             self.like_action,
             db=self.db,
         )
+        self._graduation_tester = GraduationTest()
 
     async def start(self):
         await self.db.connect()
-        # Browser uses lazy start — it starts on first new_context() call,
-        # so warmup-only invocations don't pay the browser startup cost.
         logger.info("Orchestrator started")
 
     async def stop(self):
@@ -104,10 +99,6 @@ class Orchestrator:
     # ──────────────────────────────────────────
 
     async def generate_accounts(self, target_count: int, concurrency: int = 3):
-        """
-        target_count 垢を生成する。
-        concurrency: 同時に走らせるブラウザ数（プロキシ帯域に注意）
-        """
         existing = await self.db.list_accounts()
         already = len(existing)
         need = max(0, target_count - already)
@@ -121,9 +112,6 @@ class Orchestrator:
         limiter = _RateLimiter(self.config.factory.max_per_hour)
 
         async def _create_one():
-            # レート制限はまず全体で直列に予約 (concurrency に関係なく守られる)。
-            # sem の取得はその後 — 複数タスクが同時に実行枠に入ることはあるが、
-            # 「開始時刻」自体は max_per_hour に従って均等分散される。
             await limiter.wait()
             async with sem:
                 account = await self.factory.create_one()
@@ -141,9 +129,6 @@ class Orchestrator:
     # ──────────────────────────────────────────
 
     async def run_warmup_cycle(self, concurrency: int = 5):
-        """
-        全アクティブ垢の1日分ウォームアップを並列実行。
-        """
         accounts = await self.db.list_accounts()
         active = [
             a for a in accounts
@@ -161,10 +146,54 @@ class Orchestrator:
                     await self.db.update_last_action(account.id)
                     if account.status == AccountStatus.CREATED:
                         await self.db.update_status(account.id, AccountStatus.WARMING)
-                # ランダム間隔でスロットリング
                 await asyncio.sleep(random.uniform(30, 90))
 
         tasks = [_warmup_one(a) for a in active]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ──────────────────────────────────────────
+    # 卒業テスト（検索TOP表示確認）
+    # ──────────────────────────────────────────
+
+    async def run_graduation_check(self, concurrency: int = 3):
+        """
+        ウォームアップが ACTIVE フェーズに入って graduation_min_active_days 日以上経過した
+        垢を対象に卒業テストを実行。合格すれば GRADUATED に昇格する。
+        """
+        accounts = await self.db.list_accounts()
+        candidates = [
+            a for a in accounts
+            if should_run_graduation(a, self.config.warmup)
+        ]
+
+        if not candidates:
+            logger.debug("Graduation check: no candidates")
+            return
+
+        logger.info(f"Graduation check: {len(candidates)} candidates")
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _test_one(account: Account):
+            async with sem:
+                proxy = self.proxy_manager.get_warmup_proxy(account.username)
+                result = await self._graduation_tester.run(
+                    account, proxy_url=proxy.url
+                )
+                if result.passed:
+                    await self.db.update_status(account.id, AccountStatus.GRADUATED)
+                    logger.success(
+                        f"[@{account.username}] GRADUATED "
+                        f"rank={result.rank} score={result.rank_score:.1f} "
+                        f"latency={result.search_latency_secs:.0f}s"
+                    )
+                else:
+                    logger.info(
+                        f"[@{account.username}] graduation FAIL: "
+                        f"{result.details.get('reason', 'not in top10')}"
+                    )
+                await asyncio.sleep(random.uniform(5.0, 15.0))
+
+        tasks = [_test_one(a) for a in candidates]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     # ──────────────────────────────────────────
@@ -172,9 +201,6 @@ class Orchestrator:
     # ──────────────────────────────────────────
 
     async def run_shadowban_check(self, concurrency: int = 10):
-        """
-        全垢を検査し、バン状態を更新。解除アクションも自動実行。
-        """
         accounts = await self.db.list_accounts()
         sem = asyncio.Semaphore(concurrency)
 
@@ -189,7 +215,8 @@ class Orchestrator:
                     logger.info(f"[@{account.username}] status {account.status} → {new_status}")
 
                 if not ban_status.is_clean:
-                    proxy = self.proxy_manager.get_proxy_for_account(account.username)
+                    # 解除アクションにはサインアップ用プロキシではなくウォームアップ用を使う
+                    proxy = self.proxy_manager.get_warmup_proxy(account.username)
                     await self.resolver.resolve(account, ban_status, proxy_url=proxy.url)
 
                 await asyncio.sleep(random.uniform(2.0, 5.0))
@@ -212,8 +239,9 @@ class Orchestrator:
         永続ループ:
         1. 不足垢を補充
         2. ウォームアップ実行
-        3. シャドウバン確認
-        4. 次のサイクルまで待機
+        3. 卒業テスト（候補がいれば）
+        4. シャドウバン確認
+        5. 次のサイクルまで待機
         """
         logger.info(f"run_forever: target={target_count}, check_interval={check_interval_hours}h")
 
@@ -225,10 +253,13 @@ class Orchestrator:
                 # 2. ウォームアップ
                 await self.run_warmup_cycle(concurrency=warmup_concurrency)
 
-                # 3. シャドウバン確認（6時間に1回）
+                # 3. 卒業テスト
+                await self.run_graduation_check()
+
+                # 4. シャドウバン確認
                 await self.run_shadowban_check()
 
-                # 4. 待機
+                # 5. 待機
                 wait = check_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
                 logger.info(f"Cycle done, sleeping {(wait + jitter) / 3600:.1f}h")
