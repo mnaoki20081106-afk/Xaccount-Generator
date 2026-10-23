@@ -1,8 +1,8 @@
 """
 X 内部 API クライアント — curl_cffi ベースのブラウザ不要アクション。
 
-auth_token + ct0 がある垢は Chromium を起動せずに
-like / follow / tweet / タイムライン取得を API 一発で実行できる。
+auth_token + ct0 がある垃は Chromium を起動せずに
+like / follow / tweet / タイムライン取得 / GraphQL 検索 を API 一発で実行できる。
 
 x-client-transaction-id ヘッダーを自動生成（x.com から鍵を取得、キャッシュ）。
 
@@ -12,8 +12,10 @@ x-client-transaction-id ヘッダーを自動生成（x.com から鍵を取得�
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import Optional
 from urllib.parse import urlparse
@@ -39,6 +41,11 @@ _BEARER = (
 )
 
 _BASE = "https://x.com/i/api"
+_GQL_URL = f"{_BASE}/graphql"
+
+# vladkens/twscrape 参照。SearchTimeline GraphQL operation ID。
+# 変更された場合は scripts/update-gql-ops.py で更新が必要。
+_GQL_SEARCH_OP = "BYppgupFFS2yqVmmRNjlsw/SearchTimeline"
 
 # curl_cffi の Chrome バージョン（api_flow.py と揃える）
 _IMPERSONATE = "chrome136"
@@ -49,8 +56,84 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
+# vladkens/twscrape GQL_FEATURES より引用。欠けると (336) エラーになる場合がある。
+_GQL_FEATURES = {
+    "articles_preview_enabled": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
+    "responsive_web_grok_imagine_annotation_enabled": False,
+    "responsive_web_media_download_video_enabled": False,
+    "responsive_web_profile_redirect_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "tweet_with_visibility_results_prefer_gql_media_interstitial_enabled": False,
+    "tweetypie_unmention_optimization_enabled": True,
+    "verified_phone_label_enabled": False,
+    "view_counts_everywhere_api_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": False,
+    "responsive_web_grok_share_attachment_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": False,
+    "responsive_web_grok_analysis_button_from_backend": False,
+    "responsive_web_jetfuel_frame": False,
+    "rweb_video_screen_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+}
 
-# ── Typed exceptions ────────────────────────────────────────────────────────
+_ENTRY_TWEET_RE = re.compile(r"(?:^|-)tweet-(\d+)(?:-|$)")
+
+
+def _collect_entry_ids(obj: dict, out: list) -> None:
+    """GraphQL レスポンスから entryId を表示順に収集。"""
+    if not isinstance(obj, dict):
+        return
+    if isinstance(obj.get("entryId"), str):
+        out.append(obj["entryId"])
+    for v in obj.values():
+        if isinstance(v, dict):
+            _collect_entry_ids(v, out)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    _collect_entry_ids(item, out)
+
+
+def _extract_tweet_ids_from_gql(data: dict) -> list[str]:
+    """GraphQL SearchTimeline レスポンスからツイートIDを表示順で抽出。"""
+    entry_ids: list[str] = []
+    _collect_entry_ids(data, entry_ids)
+    ids: list[str] = []
+    seen: set[str] = set()
+    for eid in entry_ids:
+        m = _ENTRY_TWEET_RE.search(eid)
+        if m:
+            tid = m.group(1)
+            if tid not in seen:
+                seen.add(tid)
+                ids.append(tid)
+    return ids
+
+
+# ── Typed exceptions ─────────────────────────────────────────────────────
 
 class XApiError(Exception):
     """Base class for X API errors."""
@@ -86,7 +169,7 @@ class XDuplicateTweet(XApiError):
     """重複ツイート（187）。"""
 
 
-# ── Error code → exception ───────────────────────────────────────────────────
+# ── Error code → exception ───────────────────────────────────────────────
 
 _ERROR_CODE_MAP: dict[int, type[XApiError]] = {
     187: XDuplicateTweet,
@@ -118,7 +201,7 @@ def _raise_for_status(r) -> None:
         raise XApiError(f"HTTP {sc} server error", sc)
 
 
-# ── Header helpers ───────────────────────────────────────────────────────────
+# ── Header helpers ──────────────────────────────────────────────────
 
 def _base_headers(ct0: str, transaction_id: Optional[str] = None) -> dict:
     h = {
@@ -142,7 +225,7 @@ def _cookies(auth_token: str, ct0: str) -> dict:
     return {"auth_token": auth_token, "ct0": ct0}
 
 
-# ── ClientTransaction cache ──────────────────────────────────────────────────
+# ── ClientTransaction cache ─────────────────────────────────────────────
 
 _transaction_cache: dict[str, ClientTransaction] = {}
 _transaction_lock = asyncio.Lock()
@@ -177,7 +260,7 @@ def _invalidate_transaction(proxy_key: str) -> None:
     _transaction_cache.pop(proxy_key, None)
 
 
-# ── XApiClient ───────────────────────────────────────────────────────────────
+# ── XApiClient ─────────────────────────────────────────────────────────
 
 class XApiClient:
     """
@@ -266,6 +349,34 @@ class XApiClient:
             body = r.json()
             _raise_for_errors(body if isinstance(body, dict) else {})
             return body
+
+    # ────────────────────────────────────────────
+    # GraphQL 検索
+    # ────────────────────────────────────────────
+
+    async def search_live_ids(self, query: str, count: int = 20) -> list[str]:
+        """GraphQL SearchTimeline でライブ検索。ツイートIDリストを表示順で返す。"""
+        variables = {
+            "rawQuery": query,
+            "count": count,
+            "product": "Latest",
+            "querySource": "typed_query",
+        }
+        params = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": json.dumps(_GQL_FEATURES, separators=(",", ":")),
+            "fieldToggles": json.dumps({"withArticleRichContentState": False}, separators=(",", ":")),
+        }
+        try:
+            body = await self._get(f"{_GQL_URL}/{_GQL_SEARCH_OP}", params=params)
+            return _extract_tweet_ids_from_gql(body or {})
+        except XRateLimited as e:
+            logger.warning(f"[XApi] search_live_ids: rate limited reset={e.reset_at}")
+        except XUnauthorized:
+            logger.warning("[XApi] search_live_ids: unauthorized")
+        except Exception as e:
+            logger.debug(f"[XApi] search_live_ids error: {e}")
+        return []
 
     # ────────────────────────────────────────────
     # タイムライン取得（like 用のツイート ID 収集）
