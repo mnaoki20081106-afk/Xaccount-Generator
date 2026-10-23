@@ -49,10 +49,12 @@ class _RateLimiter:
 
 
 class Orchestrator:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, proxy_manager: ProxyManager | None = None):
         self.config = config
         self.db = Database(config.db.path)
-        self.proxy_manager = ProxyManager(config.proxy)
+        # APIサーバーと同じインスタンスを共有できる（別インスタンスだと
+        # proxy_sessions.json を互いに上書きしてしまうため）。
+        self.proxy_manager = proxy_manager or ProxyManager(config.proxy)
         self.twofa_manager = TwoFAManager(config.twofa.encryption_key)
         self.browser = BrowserManager(
             headless=config.browser.headless,

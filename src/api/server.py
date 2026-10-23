@@ -16,6 +16,10 @@ import asyncio
 import hashlib
 import hmac
 import os
+import platform
+import re
+import shutil
+import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -28,6 +32,7 @@ from pydantic import BaseModel
 from ..config import load_config, AppConfig
 from ..db import Database
 from ..models import AccountStatus
+from ..proxy.manager import ProxyManager
 
 _MAX_SKEW_MS = 5 * 60_000
 _NONCE_LIFETIME_MS = _MAX_SKEW_MS
@@ -93,6 +98,11 @@ async def _verify_request(request: Request, body: bytes) -> None:
 class _AppState:
     db: Database
     config: AppConfig
+    proxy_manager: ProxyManager
+    _health_task: Optional[asyncio.Task] = None
+    _health_started_at: Optional[float] = None
+    _health_finished_at: Optional[float] = None
+    _health_result: Optional[dict] = None
     _orchestrator_task: Optional[asyncio.Task] = None
     _orchestrator_running: bool = False
     _orchestrator_target: int = 0
@@ -100,6 +110,7 @@ class _AppState:
 
 
 _state = _AppState()
+_started_at = time.time()
 
 
 @asynccontextmanager
@@ -108,6 +119,8 @@ async def _lifespan(app: FastAPI):
     _state.config = load_config(config_path)
     _state.db = Database(_state.config.db.path)
     await _state.db.connect()
+    # オーケストレーターと共有する唯一のProxyManager（状態ファイルの上書き競合を防ぐ）
+    _state.proxy_manager = ProxyManager(_state.config.proxy)
     yield
     await _state.db.close()
     if _state._orchestrator_task and not _state._orchestrator_task.done():
@@ -281,7 +294,7 @@ async def start_generation(request: Request, body_model: GenerateRequest):
         _state._orchestrator_running = True
         _state._orchestrator_target = body_model.count
         _state._orchestrator_started_at = time.time()
-        orc = Orchestrator(_state.config)
+        orc = Orchestrator(_state.config, proxy_manager=_state.proxy_manager)
         await orc.start()
         try:
             await orc.generate_accounts(body_model.count, concurrency=body_model.concurrency)
@@ -329,4 +342,177 @@ async def get_config(request: Request):
             "actions_per_day_soft": cfg.warmup.actions_per_day_soft,
         },
         "db": {"path": cfg.db.path},
+    }
+
+
+# ─────────────────────────────────────────────
+# プロキシ管理
+# ─────────────────────────────────────────────
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+
+
+def _health_state() -> dict:
+    running = bool(_state._health_task and not _state._health_task.done())
+    return {
+        "running": running,
+        "started_at": _state._health_started_at,
+        "finished_at": _state._health_finished_at,
+        "result": _state._health_result,
+    }
+
+
+@app.get("/api/generator/proxy")
+async def get_proxy(request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+
+    cfg = _state.config.proxy
+    return {
+        "config": {
+            "provider": cfg.provider,
+            "host": cfg.host,
+            "port": cfg.port,
+            "country": cfg.country,
+            "sticky_ttl_minutes": cfg.sticky_ttl_minutes,
+            "max_accounts_per_ip": cfg.max_accounts_per_ip,
+        },
+        "summary": _state.proxy_manager.status_report(),
+        "sessions": _state.proxy_manager.sessions_report(),
+        "health_check": _health_state(),
+    }
+
+
+@app.post("/api/generator/proxy/health-check")
+async def run_proxy_health_check(request: Request):
+    raw_body = await request.body()
+    await _verify_request(request, raw_body)
+
+    if _state._health_task and not _state._health_task.done():
+        raise HTTPException(409, detail="HEALTH_CHECK_ALREADY_RUNNING")
+
+    async def _run():
+        try:
+            results = await _state.proxy_manager.health_check_all()
+            ok = sum(1 for v in results.values() if v)
+            _state._health_result = {"checked": len(results), "healthy": ok, "unhealthy": len(results) - ok}
+        except Exception as exc:  # 結果として画面に出す。サーバーは落とさない
+            _state._health_result = {"error": str(exc)[:200]}
+        finally:
+            _state._health_finished_at = time.time()
+
+    _state._health_started_at = time.time()
+    _state._health_finished_at = None
+    _state._health_result = None
+    _state._health_task = asyncio.create_task(_run())
+    return {"ok": True}
+
+
+class ProxyResetRequest(BaseModel):
+    circuit: bool = True
+    cooldown: bool = False
+
+
+@app.post("/api/generator/proxy/sessions/{session_id}/reset")
+async def reset_proxy_session(session_id: str, request: Request):
+    raw_body = await request.body()
+    await _verify_request(request, raw_body)
+
+    # Parsed after the signature check so unsigned callers always get 401.
+    try:
+        body_model = ProxyResetRequest.model_validate_json(raw_body or b"{}")
+    except ValueError:
+        raise HTTPException(400, detail="INVALID_BODY")
+
+    if not _SESSION_ID.fullmatch(session_id):
+        raise HTTPException(400, detail="INVALID_SESSION_ID")
+    if not (body_model.circuit or body_model.cooldown):
+        raise HTTPException(400, detail="NOTHING_TO_RESET")
+    if not _state.proxy_manager.reset_session(
+        session_id, circuit=body_model.circuit, cooldown=body_model.cooldown
+    ):
+        raise HTTPException(404, detail="SESSION_NOT_FOUND")
+    return {"ok": True}
+
+
+@app.delete("/api/generator/proxy/sessions/{session_id}")
+async def delete_proxy_session(session_id: str, request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+
+    if not _SESSION_ID.fullmatch(session_id):
+        raise HTTPException(400, detail="INVALID_SESSION_ID")
+    outcome = _state.proxy_manager.remove_session(session_id)
+    if outcome == "not_found":
+        raise HTTPException(404, detail="SESSION_NOT_FOUND")
+    if outcome == "in_use":
+        raise HTTPException(409, detail="SESSION_IN_USE")
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────
+# サーバー（VPS）状態
+# ─────────────────────────────────────────────
+
+def _read_meminfo() -> Optional[dict]:
+    try:
+        values: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+                    values[key] = int(rest.split()[0]) * 1024
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        if not total or available is None:
+            return None
+        return {"total": total, "available": available, "used": total - available}
+    except (OSError, ValueError):
+        return None
+
+
+def _read_host_uptime() -> Optional[float]:
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _file_size(path: str) -> Optional[int]:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+@app.get("/api/generator/server")
+async def get_server_info(request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+
+    data_dir = os.path.dirname(os.path.abspath(_state.config.db.path)) or "."
+    try:
+        usage = shutil.disk_usage(data_dir)
+        disk = {"total": usage.total, "used": usage.used, "free": usage.free}
+    except OSError:
+        disk = None
+    try:
+        load = list(os.getloadavg())
+    except (OSError, AttributeError):
+        load = None
+
+    return {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "cpu_count": os.cpu_count(),
+        "load_average": load,
+        "memory": _read_meminfo(),
+        "disk": disk,
+        "host_uptime_seconds": _read_host_uptime(),
+        "api_uptime_seconds": time.time() - _started_at,
+        "db_size_bytes": _file_size(_state.config.db.path),
+        "log_size_bytes": _file_size(_state.config.logging.file),
+        "orchestrator_running": _state._orchestrator_running,
     }

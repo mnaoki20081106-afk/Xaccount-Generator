@@ -328,6 +328,80 @@ class ProxyManager:
     def release(self, account_key: str):
         self._account_map.pop(account_key, None)
 
+    # ──────────────────────────────────────────
+    # 管理画面向け（読み取り・運用操作）
+    # ──────────────────────────────────────────
+
+    def sessions_report(self) -> list[dict]:
+        """全セッションの状態一覧。状態の自動リセットなど副作用は起こさない。"""
+        now = datetime.now(timezone.utc)
+        max_per_ip = self.config.max_accounts_per_ip
+        assigned: dict[str, int] = {}
+        for sid in list(self._account_map.values()) + list(self._warmup_map.values()):
+            assigned[sid] = assigned.get(sid, 0) + 1
+
+        rows = []
+        for sid, d in self._sessions.items():
+            sess = ProxySession(d, self.config)
+            cooldown_until = sess.cooldown_until
+            circuit_until = sess.circuit_open_until
+            cooling = bool(cooldown_until and now < cooldown_until)
+            circuit_open = bool(circuit_until and now < circuit_until)
+            if circuit_open:
+                state = "circuit_open"
+            elif cooling:
+                state = "cooling"
+            elif sess.account_count >= max_per_ip:
+                state = "full"
+            else:
+                state = "ready"
+            rows.append({
+                "session_id": sid,
+                "state": state,
+                "account_count": sess.account_count,
+                "max_accounts": max_per_ip,
+                "assigned_accounts": assigned.get(sid, 0),
+                "consecutive_failures": sess.consecutive_failures,
+                "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+                "circuit_open_until": circuit_until.isoformat() if circuit_until else None,
+                "last_signup_at": sess.last_signup_at.isoformat() if sess.last_signup_at else None,
+                "last_exit_ip": d.get("last_exit_ip") or None,
+            })
+        rows.sort(key=lambda r: r["last_signup_at"] or "", reverse=True)
+        return rows
+
+    def reset_session(self, session_id: str, *, circuit: bool = True, cooldown: bool = False) -> bool:
+        """サーキットブレーカー／クーリングを解除する。cooldown=Trueは
+        3週間の再利用待ちを飛ばして、割当数も0に戻す（運用者が明示した場合のみ）。"""
+        d = self._sessions.get(session_id)
+        if d is None:
+            return False
+        if circuit:
+            d["consecutive_failures"] = 0
+            d["circuit_open_until"] = None
+        if cooldown:
+            d["cooldown_until"] = None
+            d["account_count"] = 0
+            d["last_signup_at"] = None
+        self._save_state()
+        logger.info(f"Proxy session={session_id} reset (circuit={circuit}, cooldown={cooldown})")
+        return True
+
+    def remove_session(self, session_id: str) -> str:
+        """未使用のセッションだけ削除する。垢が紐付いているものは削除しない。"""
+        if session_id not in self._sessions:
+            return "not_found"
+        in_use = (
+            session_id in self._account_map.values()
+            or session_id in self._warmup_map.values()
+        )
+        if in_use:
+            return "in_use"
+        del self._sessions[session_id]
+        self._save_state()
+        logger.info(f"Proxy session={session_id} removed")
+        return "removed"
+
     def status_report(self) -> dict:
         total = len(self._sessions)
         cooling = sum(
