@@ -6,7 +6,8 @@
   2. X のインデックス反映を待機（最大 3 分、指数バックオフ）
   3. ゲスト検索 API でそのマーカーを検索（未認証 = 一般ユーザー視点）
   4. ツイートの表示順位を計測 → GraduationResult を返す
-  5. テストツイートを削除（cleanup=True のとき）
+
+※ テストツイートは削除しない。削除はアルゴリズム評価に悪影響を及ぼす。
 
 合格基準: ツイートが検索結果の上位10件以内に表示されること。
   rank=1  → rank_score=1.0
@@ -82,7 +83,6 @@ class GraduationTest:
         self,
         account: Account,
         proxy_url: Optional[str] = None,
-        cleanup: bool = True,
     ) -> GraduationResult:
         if not HAS_CURL_CFFI or not XApiClient:
             return GraduationResult.fail("curl_cffi unavailable — API mode required")
@@ -104,13 +104,6 @@ class GraduationTest:
         logger.info(f"[@{account.username}] graduation tweet posted id={tweet_id} marker={marker}")
 
         result = await self._wait_and_search(account.username, marker, tweet_id)
-
-        if cleanup and tweet_id:
-            try:
-                async with XApiClient(account.auth_token, account.ct0, proxy_url=proxy_url) as client:
-                    await client.delete_tweet(tweet_id)
-            except Exception as e:
-                logger.debug(f"[@{account.username}] graduation cleanup error: {e}")
 
         logger.info(
             f"[@{account.username}] graduation {'PASS' if result.passed else 'FAIL'} "
