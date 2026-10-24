@@ -55,10 +55,13 @@ async def enable_totp_2fa(
     click_timeout_ms: int = 15000,
     qr_attempts: int = 10,
     confirm_timeout_ms: int = 10000,
+    stage: Optional[dict] = None,
 ) -> Optional[str]:
     """ログイン済みの page で 2FA を有効化する。成功時のみ平文の secret を返す。
 
-    どの段階で失敗しても例外は握りつぶさず None を返す（呼び出し側は 2FA なしで納品する）。
+    どの段階で失敗しても例外は出さず None を返す（呼び出し側は 2FA なしで納品する）。
+    stage を渡すと、QR が読めず失敗した場合に stage["failed_at"] = "qr" を入れる
+    （リソースブロック有りで QR が出なかった場合に、ブロック無しで再試行するため）。
     """
     async def click(text: str):
         await page.get_by_text(text).first.click(timeout=click_timeout_ms)
@@ -73,6 +76,8 @@ async def enable_totp_2fa(
         secret = await _decode_when_rendered(page, qr_attempts, step_wait_ms)
         if not secret:
             logger.warning("2FA: QRコードから secret を取得できず")
+            if stage is not None:
+                stage["failed_at"] = "qr"
             return None
 
         await click("Next")

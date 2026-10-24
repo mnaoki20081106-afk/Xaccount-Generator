@@ -133,7 +133,11 @@ class AccountFactory:
         return encrypt_secret(pw, self.config.twofa.encryption_key)
 
     async def _enroll_2fa(self, username: str, auth_token, ct0, proxy_url: str) -> str | None:
-        """X 側で 2FA を有効化し、暗号化した秘密鍵を返す。失敗時は None（未登録の鍵は渡さない）。"""
+        """X 側で 2FA を有効化し、暗号化した秘密鍵を返す。失敗時は None（未登録の鍵は渡さない）。
+
+        通信量を抑えるため、まず画像・フォント等をブロックしたページで試す。
+        QR が出なかった場合だけ、ブロック無しで1回だけ再試行する。
+        """
         if not (self.config.twofa.enabled and self.config.factory.enroll_2fa) or not auth_token or not ct0:
             return None
         from ..auth.twofa_enroll import enable_totp_2fa
@@ -145,8 +149,18 @@ class AccountFactory:
                 {"name": "auth_token", "value": auth_token, "domain": ".x.com", "path": "/", "secure": True, "httpOnly": True},
                 {"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/", "secure": True},
             ])
-            page = await self.browser.new_page(context, block_resources=False)
-            secret = await enable_totp_2fa(page)
+            traffic = [0]
+            secret = None
+            for block in (True, False):
+                page = await self.browser.new_page(context, block_resources=block)
+                await self._count_traffic(context, page, traffic)
+                stage: dict = {}
+                secret = await enable_totp_2fa(page, stage=stage)
+                await page.close()
+                if secret or stage.get("failed_at") != "qr":
+                    break
+                logger.info(f"[{username}] 2FA: QR が出ないためリソースブロック無しで再試行")
+            logger.info(f"[{username}] 2FA traffic ≈ {traffic[0] / 1024:.0f} KB")
             if not secret:
                 return None
             logger.success(f"[{username}] 2FA enabled")
@@ -157,6 +171,19 @@ class AccountFactory:
         finally:
             if context is not None:
                 await context.close()
+
+    @staticmethod
+    async def _count_traffic(context, page, counter: list) -> None:
+        """Chromium DevTools の Network.loadingFinished で受信バイト数を数える（計測のみ）。"""
+        try:
+            cdp = await context.new_cdp_session(page)
+            await cdp.send("Network.enable")
+            cdp.on(
+                "Network.loadingFinished",
+                lambda e: counter.__setitem__(0, counter[0] + int(e.get("encodedDataLength", 0))),
+            )
+        except Exception as e:
+            logger.debug(f"traffic meter unavailable: {e}")
 
     async def _create_via_api_flow(
         self,

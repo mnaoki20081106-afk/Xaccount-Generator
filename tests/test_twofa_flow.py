@@ -82,3 +82,15 @@ def test_unreadable_qr_returns_none():
 
 def test_missing_button_returns_none_instead_of_raising():
     assert run(enable_totp_2fa(_Page([_qr_png()], missing={"Get started"}))) is None
+
+
+def test_qr_failure_sets_stage_marker():
+    stage = {}
+    assert run(enable_totp_2fa(_Page([b"nope"]), qr_attempts=2, stage=stage)) is None
+    assert stage == {"failed_at": "qr"}
+
+
+def test_other_failures_do_not_set_qr_marker():
+    stage = {}
+    run(enable_totp_2fa(_Page([_qr_png()], code_rejected=True), stage=stage))
+    assert stage == {}
