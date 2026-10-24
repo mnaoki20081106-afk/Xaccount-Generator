@@ -92,3 +92,12 @@ def test_client_flags_set_by_note():
     c._note(XAutomated("x", 226))
     c._note(XAccountLocked("x", 326))
     assert c.flags == {"automated", "locked"}
+
+
+def test_graduation_min_days_cannot_go_below_21():
+    import pytest
+    from pydantic import ValidationError
+    from src.config import WarmupConfig
+    assert WarmupConfig().graduation_min_days == 21
+    with pytest.raises(ValidationError):
+        WarmupConfig(graduation_min_days=14)

@@ -74,7 +74,7 @@ class WarmupConfig(BaseModel):
     min_days_before_sale: int = 21       # HStoraレベル: 21日以上
     actions_per_day_soft: int = 8
     require_graduation: bool = False     # True: /pop は卒業テスト合格済みの垢だけ払い出す
-    graduation_min_days: int = 21
+    graduation_min_days: int = Field(21, ge=21)  # 作成から21日未満の垢には卒業テストを撃たない（下限固定）
     graduation_min_active_days: int = 10 # 実際に行動した日数の下限
     graduation_min_tweets: int = 8
     graduation_max_unplanned_ip_changes: int = 0

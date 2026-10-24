@@ -244,7 +244,16 @@ class Orchestrator:
 
     async def run_graduation_cycle(self, concurrency: int = 2) -> dict:
         """CLEAN（検査で問題なし）かつ経過日数を満たした垢に卒業テストを回す。"""
-        accounts = await self.db.list_accounts(status=AccountStatus.CLEAN, limit=_ALL)
+        # 作成から graduation_min_days(>=21)日経っていない垢・合格済みの垢は対象にしない
+        # （観測者の検索を無駄撃ちしない）。examine 側でも同じ条件を再確認する。
+        min_days = self.config.warmup.graduation_min_days
+        now = datetime.now(timezone.utc)
+        graduated = await self.db.graduated_account_ids()
+        accounts = [
+            a for a in await self.db.list_accounts(status=AccountStatus.CLEAN, limit=_ALL)
+            if a.id not in graduated
+            and (now - (a.created_at if a.created_at.tzinfo else a.created_at.replace(tzinfo=timezone.utc))).days >= min_days
+        ]
         sem = asyncio.Semaphore(concurrency)
         tally: dict[str, int] = {}
 
