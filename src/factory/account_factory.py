@@ -124,6 +124,14 @@ class AccountFactory:
     # API フロー (Playwright 不要)
     # ────────────────────────────────────────────────
 
+    def _enc_email_password(self, mail_client) -> str | None:
+        """メールのパスワードを暗号化して返す（納品時にメールへ入れるように）。"""
+        pw = getattr(mail_client, "password", None)
+        if not pw:
+            return None
+        from ..utils.crypto import encrypt_secret
+        return encrypt_secret(pw, self.config.twofa.encryption_key)
+
     async def _create_via_api_flow(
         self,
         email: str,
@@ -150,15 +158,15 @@ class AccountFactory:
         if not ok or not flow.auth_token:
             return None
 
+        # 2FA: X 側への登録(有効化)フローが未実装のため、ランダムな秘密鍵を作って
+        # 「2FAあり」と見せかけて納品しない（客が使えないキーを渡す品質事故になる）。
         twofa_secret = None
-        if self.config.twofa.enabled:
-            raw = self.twofa_manager.generate_secret()
-            twofa_secret = self.twofa_manager.encrypt(raw)
 
         account = Account(
             username=flow.username or f"api_{int(time.time())}",
             password=flow.password,
             email=email,
+            email_password=self._enc_email_password(mail_client),
             phone=None,
             twofa_secret=twofa_secret,
             auth_token=flow.auth_token,
@@ -180,17 +188,30 @@ class AccountFactory:
 
     async def create_one(self) -> Account | None:
         username = _gen_username()
+        account = None
+        try:
+            account = await self._create_one(username)
+            return account
+        finally:
+            if account is None:
+                # 失敗したのにIPの枠だけ消費しないよう返す
+                self.proxy_manager.release_failed_signup(username)
+
+    async def _create_one(self, username: str) -> Account | None:
         password = _gen_password()
         display_name = _gen_display_name()
+
+        # 先にプロキシを確認する。メール（Outlook は Captcha 代がかかる）を作ってから
+        # プロキシ不良で捨てると、その分のコストが丸ごと無駄になる。
+        proxy = self.proxy_manager.get_proxy_for_account(username)
+        if not await self.proxy_manager.health_check(proxy):
+            logger.warning(f"[{username}] proxy unhealthy, skip")
+            return None
+
         email, mail_client = await self._get_email(username)
 
         if not email:
             logger.error(f"[{username}] email取得失敗")
-            return None
-
-        proxy = self.proxy_manager.get_proxy_for_account(username)
-        if not await self.proxy_manager.health_check(proxy):
-            logger.warning(f"[{username}] proxy unhealthy, skip")
             return None
 
         # ── API フロー (Playwright 不要、高速) ────────────────────────────────
@@ -254,15 +275,13 @@ class AccountFactory:
                 await setup_profile(profile_page, username, display_name)
                 await profile_page.close()
 
-            twofa_secret = None
-            if self.config.twofa.enabled:
-                raw = self.twofa_manager.generate_secret()
-                twofa_secret = self.twofa_manager.encrypt(raw)
+            twofa_secret = None  # 上記 API フロー側のコメント参照（未登録の鍵は渡さない）
 
             account = Account(
                 username=username,
                 password=password,
                 email=email,
+                email_password=self._enc_email_password(mail_client),
                 phone=phone_number,
                 twofa_secret=twofa_secret,
                 auth_token=auth_token,

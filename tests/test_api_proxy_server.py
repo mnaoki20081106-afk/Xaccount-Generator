@@ -190,3 +190,79 @@ def test_server_info_reports_host_and_data_stats(api):
     assert "memory" in info and "load_average" in info
     for key in ("db_size_bytes", "log_size_bytes", "host_uptime_seconds"):
         assert key in info
+
+
+# ── pop（納品）────────────────────────────────────────────────
+
+def _seed(server, specs):
+    """specs: [(username, age_days, status, graduated)] を DB に直接入れて id 一覧を返す。"""
+    import sqlite3
+    from src.utils.crypto import encrypt_secret
+    key = server._state.config.twofa.encryption_key
+    con = sqlite3.connect(server._state.config.db.path)
+    ids = []
+    for name, age, status, grad in specs:
+        cur = con.execute(
+            "INSERT INTO accounts (username,password,email,email_password,twofa_secret,auth_token,ct0,"
+            "status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (name, "pw", f"{name}@mail.test", encrypt_secret("mailpw", key),
+             encrypt_secret("JBSWY3DPEHPK3PXP", key), "t" * 40, "c" * 32, status,
+             (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()))
+        ids.append(cur.lastrowid)
+        if grad:
+            con.execute("INSERT INTO graduation (account_id, passed) VALUES (?,1)", (cur.lastrowid,))
+    con.commit()
+    con.close()
+    return ids
+
+
+@pytest.fixture
+def pop_api(api, monkeypatch):
+    call, server, _ = api
+
+    async def alive(account):
+        return True
+    monkeypatch.setattr(server, "_alive_for_sale", alive)
+    return call, server
+
+
+def test_pop_validates_and_reports_out_of_stock(api):
+    call, server, _ = api
+    assert call("POST", "/api/generator/pop", {"count": 1, "tier": "bogus"}).status_code == 400
+    assert call("POST", "/api/generator/pop", {"count": 1}).status_code == 409
+
+
+def test_pop_sells_oldest_first_and_never_twice(pop_api):
+    call, server = pop_api
+    _seed(server, [("young", 22, "clean", False), ("old", 60, "clean", False), ("mid", 40, "clean", False)])
+    r = call("POST", "/api/generator/pop", {"count": 2}).json()
+    assert [a["username"] for a in r["accounts"]] == ["old", "mid"]
+    again = call("POST", "/api/generator/pop", {"count": 5}).json()
+    assert [a["username"] for a in again["accounts"]] == ["young"]
+    assert call("POST", "/api/generator/pop", {"count": 1}).status_code == 409
+
+
+def test_pop_returns_plain_secrets_not_ciphertext(pop_api):
+    call, server = pop_api
+    _seed(server, [("a", 30, "clean", False)])
+    acc = call("POST", "/api/generator/pop", {"count": 1}).json()["accounts"][0]
+    assert acc["twofa_secret"] == "JBSWY3DPEHPK3PXP"
+    assert acc["email_password"] == "mailpw"
+
+
+def test_pop_top_search_tier_only_graduated(pop_api):
+    call, server = pop_api
+    _seed(server, [("plain", 90, "clean", False), ("grad", 30, "clean", True)])
+    r = call("POST", "/api/generator/pop", {"count": 5, "tier": "top_search"}).json()
+    assert [a["username"] for a in r["accounts"]] == ["grad"] and r["accounts"][0]["graduated"]
+
+
+def test_pop_skips_dead_accounts(api, monkeypatch):
+    call, server, _ = api
+    _seed(server, [("dead", 90, "clean", False), ("live", 30, "clean", False)])
+
+    async def alive(account):
+        return account.username != "dead"
+    monkeypatch.setattr(server, "_alive_for_sale", alive)
+    r = call("POST", "/api/generator/pop", {"count": 1}).json()
+    assert [a["username"] for a in r["accounts"]] == ["live"]

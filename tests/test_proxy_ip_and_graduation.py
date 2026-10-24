@@ -269,3 +269,14 @@ def test_detector_via_observer(env):
         assert (await det.check("target")).search_ban
         await db.close()
     asyncio.run(run())
+
+
+def test_failed_signup_returns_ip_slot(mgr):
+    mgr.config.max_accounts_per_ip = 2
+    s = mgr.get_proxy_for_account("a")
+    mgr.get_proxy_for_account("b")  # 同じセッションに2垢目 → 上限でクーリング
+    assert mgr._sessions[s.session_id]["cooldown_until"]
+    mgr.release_failed_signup("b")
+    d = mgr._sessions[s.session_id]
+    assert d["account_count"] == 1 and d["cooldown_until"] is None
+    assert "b" not in mgr._account_map

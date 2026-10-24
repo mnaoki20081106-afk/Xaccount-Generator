@@ -474,6 +474,19 @@ class ProxyManager:
     def release(self, account_key: str):
         self._account_map.pop(account_key, None)
 
+    def release_failed_signup(self, account_key: str):
+        """サインアップに失敗した時、そのIPに割り当てた枠を返す。
+        枠を返さないと、失敗するたびに max_accounts_per_ip を消費し、実際には垢が
+        できていないのに3週間のクーリングに入ってしまう（IPの無駄遣い＝単価上昇）。"""
+        self.refresh()
+        sid = self._account_map.pop(account_key, None)
+        d = self._sessions.get(sid) if sid else None
+        if d is not None:
+            d["account_count"] = max(0, d.get("account_count", 0) - 1)
+            if d["account_count"] < self.config.max_accounts_per_ip:
+                d["cooldown_until"] = None
+        self._save_state()
+
     # ──────────────────────────────────────────
     # 管理画面向け（読み取り・運用操作）
     # ──────────────────────────────────────────

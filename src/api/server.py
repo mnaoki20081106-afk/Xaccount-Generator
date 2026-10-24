@@ -230,6 +230,42 @@ class PopRequest(BaseModel):
     count: int = 1
     min_warmup_days: int = 0
     allow_soft_shadow: bool = False
+    # "top_search": 卒業テスト合格済み（検索TOP掲載を実測済み）の垢だけ。
+    # "any":        CLEAN の垢（require_graduation 有効時は合格済みのみ）。
+    tier: str = "any"
+
+
+_pop_lock = asyncio.Lock()
+
+
+def _decrypt_or_none(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    from ..utils.crypto import decrypt_secret
+    try:
+        return decrypt_secret(value, _state.config.twofa.encryption_key)
+    except Exception:
+        return None
+
+
+async def _alive_for_sale(account) -> bool:
+    """納品直前の生存確認（1回のAPI呼び出し。売ってから死んでいたと判明するより安い）。"""
+    from ..actions.x_api import HAS_CURL_CFFI, XApiClient
+    if not HAS_CURL_CFFI or not account.auth_token or not account.ct0:
+        return bool(account.auth_token and account.ct0)
+    try:
+        proxy = _state.proxy_manager.proxy_for_account(account)
+        async with XApiClient(account.auth_token, account.ct0, proxy_url=proxy.url) as client:
+            state = await client.verify_state()
+    except Exception:
+        return False  # 確認できないものは売らない（状態は変えない）
+    if state == "suspended":
+        await _state.db.update_status(account.id, AccountStatus.SUSPENDED)
+    elif state == "locked":
+        await _state.db.update_status(account.id, AccountStatus.LOCKED)
+    elif state == "unauthorized":
+        await _state.db.update_note(account.id, "token_invalid")
+    return state == "ok"
 
 
 @app.post("/api/generator/pop")
@@ -239,44 +275,70 @@ async def pop_accounts(request: Request, body_model: PopRequest):
 
     if body_model.count < 1 or body_model.count > 200:
         raise HTTPException(400, detail="INVALID_COUNT")
+    if body_model.tier not in ("any", "top_search"):
+        raise HTTPException(400, detail="INVALID_TIER")
 
-    candidates = await _state.db.list_accounts(status=AccountStatus.CLEAN, limit=1000)
-    if body_model.allow_soft_shadow:
-        soft = await _state.db.list_accounts(status=AccountStatus.SOFT_SHADOW, limit=500)
-        candidates = candidates + soft
+    from datetime import datetime, timedelta, timezone
 
-    if body_model.min_warmup_days > 0:
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(days=body_model.min_warmup_days)
-        candidates = [
-            a for a in candidates
-            if a.created_at and (
-                a.created_at if a.created_at.tzinfo else a.created_at.replace(tzinfo=timezone.utc)
-            ) <= cutoff
-        ]
+    def _aware(dt):
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-    if _state.config.warmup.require_graduation:
+    # 同時に2件の pop が走ると同じ垢を二重に売るため、選別〜販売済み化を直列化する。
+    async with _pop_lock:
+        statuses = [AccountStatus.CLEAN]
+        if body_model.allow_soft_shadow and body_model.tier != "top_search":
+            statuses.append(AccountStatus.SOFT_SHADOW)
+        candidates = []
+        for st in statuses:
+            candidates += await _state.db.list_accounts(status=st, limit=100000)
+
+        # トークンの無い垢は納品しても使えない
+        candidates = [a for a in candidates if a.auth_token and a.ct0]
+
+        if body_model.min_warmup_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=body_model.min_warmup_days)
+            candidates = [a for a in candidates if a.created_at and _aware(a.created_at) <= cutoff]
+
         graduated = await _state.db.graduated_account_ids()
-        candidates = [a for a in candidates if a.id in graduated]
+        if body_model.tier == "top_search" or _state.config.warmup.require_graduation:
+            candidates = [a for a in candidates if a.id in graduated]
 
-    selected = candidates[: body_model.count]
+        # 古い（ウォームアップが長い）垢から売る。以前は新しい順で、育った垢が
+        # 売れ残り、若い垢から出ていた。卒業済みはより優先。
+        candidates.sort(key=lambda a: (a.id not in graduated, _aware(a.created_at)))
+
+        selected = []
+        i = 0
+        while len(selected) < body_model.count and i < len(candidates):
+            need = body_model.count - len(selected)
+            chunk = candidates[i:i + max(need, 1) * 2]
+            i += len(chunk)
+            oks = await asyncio.gather(*[_alive_for_sale(a) for a in chunk])
+            for a, ok in zip(chunk, oks):
+                if len(selected) >= body_model.count:
+                    break
+                if ok and await _state.db.claim_for_sale(a.id, [s.value for s in statuses]):
+                    selected.append(a)
+
     if not selected:
         raise HTTPException(409, detail="OUT_OF_STOCK")
 
     results = []
     for account in selected:
-        await _state.db.update_status(account.id, AccountStatus.SOLD)
-        await _state.db.log_action(account.id, "sold", "popped via API")
+        await _state.db.log_action(account.id, "sold", f"popped via API tier={body_model.tier}")
         results.append({
             "id": account.id,
             "username": account.username,
             "password": account.password,
             "email": account.email,
+            "email_password": _decrypt_or_none(account.email_password),
             "phone": account.phone,
             "auth_token": account.auth_token,
             "ct0": account.ct0,
-            "twofa_secret": account.twofa_secret,
+            # 暗号文のままではなく平文の鍵を返す（本物が登録されている場合のみ）
+            "twofa_secret": _decrypt_or_none(account.twofa_secret),
             "shadow_score": account.shadow_score,
+            "graduated": account.id in graduated,
             "created_at": account.created_at.isoformat() if account.created_at else None,
         })
 

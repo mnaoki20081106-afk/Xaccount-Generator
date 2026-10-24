@@ -20,6 +20,7 @@ class Account(BaseModel):
     username: str
     password: str
     email: Optional[str] = None
+    email_password: Optional[str] = None  # encrypted
     phone: Optional[str] = None
     twofa_secret: Optional[str] = None  # encrypted
     auth_token: Optional[str] = None    # X session cookie

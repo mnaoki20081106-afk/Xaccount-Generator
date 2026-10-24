@@ -123,6 +123,7 @@ class Database:
         migrations = [
             ("add_auth_token", "ALTER TABLE accounts ADD COLUMN auth_token TEXT"),
             ("add_ct0",        "ALTER TABLE accounts ADD COLUMN ct0 TEXT"),
+            ("add_email_password", "ALTER TABLE accounts ADD COLUMN email_password TEXT"),
         ]
         for key, sql in migrations:
             row = await (await self.conn.execute(
@@ -156,8 +157,8 @@ class Database:
                 username, password, email, phone, twofa_secret,
                 auth_token, ct0, status, shadow_score, proxy_id,
                 fingerprint_hash, cookies_path, created_at, last_action_at,
-                sold_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sold_at, notes, email_password
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account.username,
@@ -176,6 +177,7 @@ class Database:
                 account.last_action_at.isoformat() if account.last_action_at else None,
                 account.sold_at.isoformat() if account.sold_at else None,
                 account.notes,
+                account.email_password,
             ),
         )
         await self.conn.commit()
@@ -217,6 +219,20 @@ class Database:
             "UPDATE accounts SET status = ? WHERE id = ?",
             (status.value, account_id),
         )
+        await self.conn.commit()
+
+    async def claim_for_sale(self, account_id: int, from_statuses: list[str]) -> bool:
+        """販売済みにする。状態が from_statuses のままの場合だけ成功する（二重販売防止）。"""
+        marks = ",".join("?" for _ in from_statuses)
+        cur = await self.conn.execute(
+            f"UPDATE accounts SET status = 'sold', sold_at = ? WHERE id = ? AND status IN ({marks})",
+            (datetime.now(timezone.utc).isoformat(), account_id, *from_statuses),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def update_note(self, account_id: int, note: str):
+        await self.conn.execute("UPDATE accounts SET notes = ? WHERE id = ?", (note, account_id))
         await self.conn.commit()
 
     async def update_shadow_score(self, account_id: int, score: float):
@@ -461,4 +477,5 @@ class Database:
             else None,
             sold_at=datetime.fromisoformat(row["sold_at"]) if row["sold_at"] else None,
             notes=row["notes"],
+            email_password=row["email_password"] if "email_password" in keys else None,
         )
