@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
     email TEXT,
+    email_password TEXT,
+    email_token TEXT,
+    email_token_verification TEXT,
     phone TEXT,
     twofa_secret TEXT,
     auth_token TEXT,
@@ -95,8 +98,11 @@ class Database:
     async def _migrate(self):
         """既存DBへの非破壊カラム追加マイグレーション。"""
         migrations = [
-            ("add_auth_token", "ALTER TABLE accounts ADD COLUMN auth_token TEXT"),
-            ("add_ct0",        "ALTER TABLE accounts ADD COLUMN ct0 TEXT"),
+            ("add_auth_token",              "ALTER TABLE accounts ADD COLUMN auth_token TEXT"),
+            ("add_ct0",                     "ALTER TABLE accounts ADD COLUMN ct0 TEXT"),
+            ("add_email_password",          "ALTER TABLE accounts ADD COLUMN email_password TEXT"),
+            ("add_email_token",             "ALTER TABLE accounts ADD COLUMN email_token TEXT"),
+            ("add_email_token_verification","ALTER TABLE accounts ADD COLUMN email_token_verification TEXT"),
         ]
         for key, sql in migrations:
             row = await (await self.conn.execute(
@@ -127,16 +133,20 @@ class Database:
         cursor = await self.conn.execute(
             """
             INSERT INTO accounts (
-                username, password, email, phone, twofa_secret,
+                username, password, email, email_password, email_token,
+                email_token_verification, phone, twofa_secret,
                 auth_token, ct0, status, shadow_score, proxy_id,
                 fingerprint_hash, cookies_path, created_at, last_action_at,
                 sold_at, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account.username,
                 account.password,
                 account.email,
+                account.email_password,
+                account.email_token,
+                account.email_token_verification,
                 account.phone,
                 account.twofa_secret,
                 account.auth_token,
@@ -322,6 +332,9 @@ class Database:
             username=row["username"],
             password=row["password"],
             email=row["email"],
+            email_password=row["email_password"] if "email_password" in keys else None,
+            email_token=row["email_token"] if "email_token" in keys else None,
+            email_token_verification=row["email_token_verification"] if "email_token_verification" in keys else None,
             phone=row["phone"],
             twofa_secret=row["twofa_secret"],
             auth_token=row["auth_token"] if "auth_token" in keys else None,
