@@ -21,7 +21,7 @@ from .actions.login import LoginAction
 from .actions.tweet import TweetAction
 from .actions.follow import FollowAction
 from .actions.like import LikeAction
-from .warmup import WarmupScheduler, is_active_hour
+from .warmup import WarmupScheduler
 from .detector import ShadowbanDetector, ShadowbanResolver
 from .graduation import GraduationExaminer
 from .observers import ObserverPool
@@ -166,8 +166,8 @@ class Orchestrator:
 
         async def _warmup_one(account: Account):
             async with sem:
-                if not is_active_hour():
-                    return  # 夜間は動かさない（IP確認の通信も無駄なので先に弾く）
+                if await self.warmup.due_reason(account):
+                    return  # 今は動かさない日/時間帯。IP確認の通信も無駄なので先に弾く
                 # 生成時と同じセッション(proxy_id)で、実際に同じ出口IPか確認してから動かす。
                 # 想定外にIPが変わっていたら記録し、その日の行動は見送る（卒業判定にも反映される）。
                 ipc = await self.proxy_manager.verify_account_ip(account)
@@ -177,10 +177,16 @@ class Orchestrator:
                     return
                 proxy = self.proxy_manager.proxy_for_account(account)
                 result = await self.warmup.run_daily_actions(account, proxy_url=proxy.url)
-                if "error" not in result:
+                if result.get("flag") == "suspended":
+                    await self.db.update_status(account.id, AccountStatus.SUSPENDED)
+                elif result.get("flag") == "locked":
+                    await self.db.update_status(account.id, AccountStatus.LOCKED)
+                elif "error" not in result and not result.get("skipped"):
                     await self.db.update_last_action(account.id)
                     if account.status == AccountStatus.CREATED:
                         await self.db.update_status(account.id, AccountStatus.WARMING)
+                if result.get("skipped"):
+                    return
                 # ランダム間隔でスロットリング
                 await asyncio.sleep(random.uniform(30, 90))
 
@@ -266,35 +272,35 @@ class Orchestrator:
         generation_concurrency: int = 2,
         warmup_concurrency: int = 5,
         check_interval_hours: float = 6.0,
+        warmup_interval_hours: float = 1.0,
     ):
         """
-        永続ループ:
-        1. 不足垢を補充
-        2. ウォームアップ実行
-        3. シャドウバン確認
-        4. 次のサイクルまで待機
+        永続ループ（warmup_interval_hours ごとに回る）:
+        - 毎回:               不足垢の補充 / ウォームアップ（垢ごとの予定セッションが来ていれば実行）
+        - check_interval ごと: シャドウバン確認 / 卒業テスト
+        ウォームアップを1時間ごとに回すのは、1日の行動を垢ごとにずらした複数セッションに
+        分けているため（6時間に1回だと予定時刻に合わせられない）。
         """
-        logger.info(f"run_forever: target={target_count}, check_interval={check_interval_hours}h")
+        logger.info(
+            f"run_forever: target={target_count}, warmup every {warmup_interval_hours}h, "
+            f"checks every {check_interval_hours}h"
+        )
+        last_check = 0.0
 
         while True:
             try:
-                # 1. 補充
                 await self.generate_accounts(target_count, concurrency=generation_concurrency)
-
-                # 2. ウォームアップ
                 await self.run_warmup_cycle(concurrency=warmup_concurrency)
 
-                # 3. シャドウバン確認（6時間に1回）
-                await self.run_shadowban_check()
+                if time.monotonic() - last_check >= check_interval_hours * 3600 or last_check == 0.0:
+                    await self.run_shadowban_check()
+                    await self.run_graduation_cycle()
+                    last_check = time.monotonic()
 
-                # 4. 卒業テスト（canary は投稿→次サイクルで検索、の2段階）
-                await self.run_graduation_cycle()
-
-                # 5. 待機
-                wait = check_interval_hours * 3600
+                wait = warmup_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
-                logger.info(f"Cycle done, sleeping {(wait + jitter) / 3600:.1f}h")
-                await asyncio.sleep(wait + jitter)
+                logger.info(f"Cycle done, sleeping {(wait + jitter) / 3600:.2f}h")
+                await asyncio.sleep(max(60.0, wait + jitter))
 
             except asyncio.CancelledError:
                 logger.info("Orchestrator loop cancelled")

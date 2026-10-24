@@ -1,6 +1,6 @@
 import aiosqlite
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from loguru import logger
 
@@ -246,6 +246,21 @@ class Database:
             (account_id, action, detail, datetime.now(timezone.utc).isoformat()),
         )
         await self.conn.commit()
+
+    async def recent_action_details(self, account_id: int, action: str, limit: int = 30) -> list[str]:
+        rows = await (await self.conn.execute(
+            "SELECT detail FROM action_log WHERE account_id = ? AND action = ? ORDER BY id DESC LIMIT ?",
+            (account_id, action, limit),
+        )).fetchall()
+        return [r["detail"] or "" for r in rows]
+
+    async def has_recent_action(self, account_id: int, action: str, hours: float) -> bool:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        row = await (await self.conn.execute(
+            "SELECT 1 FROM action_log WHERE account_id = ? AND action = ? AND created_at >= ? LIMIT 1",
+            (account_id, action, since),
+        )).fetchone()
+        return row is not None
 
     async def get_action_count_today(self, account_id: int, action: str) -> int:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

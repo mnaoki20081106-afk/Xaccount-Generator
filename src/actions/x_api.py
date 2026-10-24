@@ -320,7 +320,16 @@ class XApiClient:
     # ────────────────────────────────────────────
 
     async def home_timeline(self, count: int = 20) -> list[str]:
-        """ホームタイムラインからツイート ID を返す。"""
+        """ホームタイムラインからツイート ID を返す。GraphQL(HomeTimeline)優先、旧1.1は予備。"""
+        try:
+            ids = await self.home_timeline_gql(count)
+            if ids:
+                return ids
+        except XUnauthorized:
+            logger.warning("[XApi] home_timeline: token invalid")
+            return []
+        except Exception as e:
+            logger.debug(f"[XApi] HomeTimeline(gql) failed, legacy fallback: {e}")
         try:
             tweets = await self._get(
                 f"{_BASE}/1.1/statuses/home_timeline.json",
@@ -342,6 +351,14 @@ class XApiClient:
 
     async def like(self, tweet_id: str) -> bool:
         try:
+            try:
+                if await self.like_gql(tweet_id):
+                    return True
+            except (XAlreadyDone, XAccountSuspended, XAccountLocked, XAutomated,
+                    XActionLimit, XRateLimited, XUnauthorized):
+                raise
+            except Exception as e:
+                logger.debug(f"[XApi] FavoriteTweet(gql) failed, legacy fallback: {e}")
             await self._post(f"{_BASE}/1.1/favorites/create.json", data={"id": tweet_id})
             return True
         except (XAlreadyDone, XDuplicateTweet):
@@ -499,6 +516,8 @@ class XApiClient:
         X-Utility/src/shadowban.ts が使っている ID を既定値にしている。"""
         if operation in _query_id_cache:
             return _query_id_cache[operation]
+        if _query_id_cache.get("_scanned"):
+            return _QUERY_ID_FALLBACK[operation]
         try:
             s = self._open_session
             async with (nullcontext(s) if s else self._session()) as _s:
@@ -511,6 +530,7 @@ class XApiClient:
                         q = re.search(r'queryId:"([\w-]+)",operationName:"%s"' % op, js)
                         if q:
                             _query_id_cache[op] = q.group(1)
+                    _query_id_cache["_scanned"] = "1"
         except Exception as e:
             logger.debug(f"[XApi] queryId lookup failed: {e}")
         return _query_id_cache.setdefault(operation, _QUERY_ID_FALLBACK[operation])
@@ -582,9 +602,98 @@ class XApiClient:
         prot = legacy.get("protected") or (res.get("privacy") or {}).get("protected")
         return {"state": "protected" if prot else "ok", "screen_name": sn, "name": name, "tweet_count": cnt}
 
-    async def post_tweet(self, text: str) -> Optional[str]:
-        """ツイートして tweet id を返す（失敗は None）。tweet() は bool 互換のまま残す。"""
+    async def _graphql_post(self, operation: str, variables: dict, features: dict) -> dict:
+        """GraphQL の書き込み系（POST JSON）。queryId 失効(404)時は取り直して1回だけ再試行。"""
+        features = dict(features)
+        for attempt in range(4):
+            qid = await self._query_id(operation)
+            url = f"{_BASE}/graphql/{qid}/{operation}"
+            s = self._open_session
+            async with (nullcontext(s) if s else self._session()) as _s:
+                s = s or _s
+                tid = await self._tid(s, "POST", url)
+                r = await s.post(
+                    url,
+                    json={"variables": variables, "features": features, "queryId": qid},
+                    headers={**_base_headers(self.ct0, tid), "Content-Type": "application/json"},
+                    cookies=_cookies(self.auth_token, self.ct0),
+                )
+            if r.status_code == 404 and attempt == 0:
+                _query_id_cache.pop(operation, None)  # 古い ID → 次回 main.js から取り直す
+                _query_id_cache.pop("_scanned", None)
+                continue
+            if r.status_code == 403 and tid:
+                _invalidate_transaction(self._proxy_key)
+            _check_response(r)
+            body = r.json()
+            missing = _missing_features(body)
+            if missing:
+                features.update({k: False for k in missing})
+                continue
+            _raise_for_errors(body if isinstance(body, dict) else {})
+            return body
+        raise XApiError(f"{operation}: failed after retries")
+
+    async def like_gql(self, tweet_id: str) -> bool:
+        body = await self._graphql_post("FavoriteTweet", {"tweet_id": tweet_id}, _SEARCH_FEATURES)
+        return (body.get("data") or {}).get("favorite_tweet") == "Done"
+
+    async def retweet(self, tweet_id: str) -> bool:
         try:
+            body = await self._graphql_post(
+                "CreateRetweet", {"tweet_id": tweet_id, "dark_request": False}, _SEARCH_FEATURES)
+            return bool(next(iter(_walk(body, "retweet_results")), None))
+        except XAlreadyDone:
+            return False
+        except (XAccountSuspended, XAccountLocked, XAutomated, XActionLimit, XRateLimited) as e:
+            self._note(e)
+            logger.warning(f"[XApi] retweet: {type(e).__name__}")
+        except Exception as e:
+            logger.debug(f"[XApi] retweet error: {e}")
+        return False
+
+    async def home_timeline_gql(self, count: int = 20) -> list[str]:
+        body = await self._graphql(
+            "HomeTimeline",
+            {"count": count, "includePromotedContent": False, "latestControlAvailable": True,
+             "requestContext": "launch", "withCommunity": True},
+            _SEARCH_FEATURES,
+        )
+        ids: list[str] = []
+        for e in _walk(body, "entries"):
+            if not isinstance(e, list):
+                continue
+            for ent in e:
+                if str(ent.get("entryId", "")).startswith("tweet-"):
+                    res = next(iter(_walk(ent, "tweet_results")), {}).get("result", {}) or {}
+                    res = res.get("tweet", res)
+                    if res.get("rest_id"):
+                        ids.append(str(res["rest_id"]))
+        return ids
+
+    async def _create_tweet_gql(self, text: str) -> Optional[str]:
+        body = await self._graphql_post(
+            "CreateTweet",
+            {"tweet_text": text, "dark_request": False,
+             "media": {"media_entities": [], "possibly_sensitive": False},
+             "semantic_annotation_ids": []},
+            _SEARCH_FEATURES,
+        )
+        res = next(iter(_walk(body, "tweet_results")), {}).get("result", {}) or {}
+        return str(res.get("rest_id") or "") or None
+
+    async def post_tweet(self, text: str) -> Optional[str]:
+        """ツイートして tweet id を返す（失敗は None）。GraphQL(CreateTweet)を優先、旧1.1は最後の手段。"""
+        try:
+            try:
+                tid = await self._create_tweet_gql(text)
+                if tid:
+                    return tid
+            except (XDuplicateTweet, XAccountSuspended, XAccountLocked, XAutomated,
+                    XActionLimit, XRateLimited, XUnauthorized):
+                raise
+            except Exception as e:
+                logger.debug(f"[XApi] CreateTweet(gql) failed, legacy fallback: {e}")
             body = await self._post(
                 f"{_BASE}/1.1/statuses/update.json",
                 data={"status": text, "tweet_mode": "extended"},
@@ -608,6 +717,11 @@ class XProxyIpLost(XApiError):
 _QUERY_ID_FALLBACK = {
     "SearchTimeline": "hyPfJYJ_XAtDYoslQc-Rgg",
     "UserByScreenName": "Gb-d6r0vxPOADdG62OEBpQ",
+    # twikit (d60/twikit) の値。古くなり得るので main.js から取得できればそちらを使う
+    "FavoriteTweet": "lI07N6Otwv1PhnEgXILM7A",
+    "CreateTweet": "SiM_cAu83R0wnrpmKQQSEw",
+    "CreateRetweet": "ojPdsZsimiJrUGLR1sjUtA",
+    "HomeTimeline": "-X_hcgQzmHGl29-UXxz4sw",
 }
 _query_id_cache: dict[str, str] = {}
 
