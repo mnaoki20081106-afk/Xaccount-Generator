@@ -332,6 +332,8 @@ async def pop_accounts(request: Request, body_model: PopRequest):
             "password": account.password,
             "email": account.email,
             "email_password": _decrypt_or_none(account.email_password),
+            "email_token": account.email_token,
+            "email_token_verification": account.email_token_verification,
             "phone": account.phone,
             "auth_token": account.auth_token,
             "ct0": account.ct0,

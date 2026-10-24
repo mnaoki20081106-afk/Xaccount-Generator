@@ -124,6 +124,8 @@ class Database:
             ("add_auth_token", "ALTER TABLE accounts ADD COLUMN auth_token TEXT"),
             ("add_ct0",        "ALTER TABLE accounts ADD COLUMN ct0 TEXT"),
             ("add_email_password", "ALTER TABLE accounts ADD COLUMN email_password TEXT"),
+            ("add_email_token", "ALTER TABLE accounts ADD COLUMN email_token TEXT"),
+            ("add_email_token_verification", "ALTER TABLE accounts ADD COLUMN email_token_verification TEXT"),
         ]
         for key, sql in migrations:
             row = await (await self.conn.execute(
@@ -157,8 +159,8 @@ class Database:
                 username, password, email, phone, twofa_secret,
                 auth_token, ct0, status, shadow_score, proxy_id,
                 fingerprint_hash, cookies_path, created_at, last_action_at,
-                sold_at, notes, email_password
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sold_at, notes, email_password, email_token, email_token_verification
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account.username,
@@ -178,6 +180,8 @@ class Database:
                 account.sold_at.isoformat() if account.sold_at else None,
                 account.notes,
                 account.email_password,
+                account.email_token,
+                account.email_token_verification,
             ),
         )
         await self.conn.commit()
@@ -478,4 +482,6 @@ class Database:
             sold_at=datetime.fromisoformat(row["sold_at"]) if row["sold_at"] else None,
             notes=row["notes"],
             email_password=row["email_password"] if "email_password" in keys else None,
+            email_token=row["email_token"] if "email_token" in keys else None,
+            email_token_verification=row["email_token_verification"] if "email_token_verification" in keys else None,
         )

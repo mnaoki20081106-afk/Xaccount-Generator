@@ -21,6 +21,8 @@ class Account(BaseModel):
     password: str
     email: Optional[str] = None
     email_password: Optional[str] = None  # encrypted
+    email_token: Optional[str] = None
+    email_token_verification: Optional[str] = None
     phone: Optional[str] = None
     twofa_secret: Optional[str] = None  # encrypted
     auth_token: Optional[str] = None    # X session cookie
