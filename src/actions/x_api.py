@@ -87,12 +87,34 @@ class XDuplicateTweet(XApiError):
     """重複ツイート（187）。"""
 
 
+class XAlreadyDone(XApiError):
+    """既にいいね/フォロー済み（139, 160, 162）。失敗ではない。"""
+
+
+class XAutomated(XApiError):
+    """自動化の疑いで弾かれた（226）。続行すると凍結に近づくのでその日は止める。"""
+
+
+class XActionLimit(XApiError):
+    """日次上限（185, 344, 161）。"""
+
+
 # ── Error code → exception ───────────────────────────────────────────────────
 
 _ERROR_CODE_MAP: dict[int, type[XApiError]] = {
     187: XDuplicateTweet,
     64:  XAccountSuspended,
+    63:  XAccountSuspended,
     326: XAccountLocked,
+    139: XAlreadyDone,
+    160: XAlreadyDone,
+    162: XAlreadyDone,
+    226: XAutomated,
+    185: XActionLimit,
+    344: XActionLimit,
+    161: XActionLimit,
+    32:  XUnauthorized,
+    215: XUnauthorized,
 }
 
 
@@ -102,6 +124,18 @@ def _raise_for_errors(body: dict) -> None:
         exc_cls = _ERROR_CODE_MAP.get(code)
         if exc_cls:
             raise exc_cls(err.get("message", ""), code)
+
+
+def _check_response(r) -> None:
+    """403 等でも本文のエラーコードを先に見る（「既にいいね済み」と「ロック/自動化判定」を区別する）。"""
+    if r.status_code != 200:
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if isinstance(body, dict):
+            _raise_for_errors(body)
+    _raise_for_status(r)
 
 
 def _raise_for_status(r) -> None:
@@ -200,6 +234,18 @@ class XApiClient:
         self.proxy_url = proxy_url
         self._proxy_key = proxy_url or "direct"
         self._open_session: Optional[AsyncSession] = None
+        # 実行中に観測した「止めるべきサイン」: suspended / locked / automated / limited
+        self.flags: set[str] = set()
+
+    def _note(self, exc: Exception) -> None:
+        if isinstance(exc, XAccountSuspended):
+            self.flags.add("suspended")
+        elif isinstance(exc, XAccountLocked):
+            self.flags.add("locked")
+        elif isinstance(exc, XAutomated):
+            self.flags.add("automated")
+        elif isinstance(exc, (XActionLimit, XRateLimited)):
+            self.flags.add("limited")
 
     def _session_kwargs(self) -> dict:
         kwargs: dict = {"impersonate": _IMPERSONATE, "timeout": 20}
@@ -245,7 +291,7 @@ class XApiClient:
             )
             if r.status_code == 403 and tid:
                 _invalidate_transaction(self._proxy_key)
-            _raise_for_status(r)
+            _check_response(r)
             body = r.json()
             _raise_for_errors(body if isinstance(body, dict) else {})
             return body
@@ -264,7 +310,7 @@ class XApiClient:
             )
             if r.status_code == 403 and tid:
                 _invalidate_transaction(self._proxy_key)
-            _raise_for_status(r)
+            _check_response(r)
             body = r.json()
             _raise_for_errors(body if isinstance(body, dict) else {})
             return body
@@ -298,15 +344,11 @@ class XApiClient:
         try:
             await self._post(f"{_BASE}/1.1/favorites/create.json", data={"id": tweet_id})
             return True
-        except XForbidden:
-            return True  # already liked
-        except XDuplicateTweet:
+        except (XAlreadyDone, XDuplicateTweet):
             return True
-        except XAccountSuspended:
-            logger.error("[XApi] account suspended")
-            return False
-        except XRateLimited as e:
-            logger.warning(f"[XApi] like: rate limited, reset={e.reset_at}")
+        except (XAccountSuspended, XAccountLocked, XAutomated, XActionLimit, XRateLimited) as e:
+            self._note(e)
+            logger.warning(f"[XApi] like: {type(e).__name__}")
             return False
         except Exception as e:
             logger.debug(f"[XApi] like error: {e}")
@@ -320,6 +362,8 @@ class XApiClient:
         random.shuffle(tweet_ids)
         liked = 0
         for tid in tweet_ids[:count]:
+            if self.flags:
+                break
             if await self.like(tid):
                 liked += 1
             await asyncio.sleep(random.uniform(2.0, 6.0))
@@ -336,14 +380,14 @@ class XApiClient:
                 data={"screen_name": screen_name.lstrip("@"), "skip_status": "true"},
             )
             return True
+        except XAlreadyDone:
+            return False
+        except (XAccountSuspended, XAccountLocked, XAutomated, XActionLimit, XRateLimited) as e:
+            self._note(e)
+            logger.warning(f"[XApi] follow: {type(e).__name__}")
+            return False
         except XForbidden:
-            logger.debug(f"[XApi] follow @{screen_name}: forbidden (already following?)")
-            return False
-        except XAccountSuspended:
-            logger.error("[XApi] account suspended")
-            return False
-        except XRateLimited as e:
-            logger.warning(f"[XApi] follow: rate limited, reset={e.reset_at}")
+            logger.debug(f"[XApi] follow @{screen_name}: forbidden")
             return False
         except Exception as e:
             logger.debug(f"[XApi] follow error: {e}")
@@ -364,6 +408,8 @@ class XApiClient:
         random.shuffle(users)
         followed = 0
         for user in users[:count]:
+            if self.flags:
+                break
             sn = user.get("screen_name") or user.get("legacy", {}).get("screen_name", "")
             if not sn:
                 continue
@@ -379,24 +425,7 @@ class XApiClient:
     # ────────────────────────────────────────────
 
     async def tweet(self, text: str) -> bool:
-        try:
-            await self._post(
-                f"{_BASE}/1.1/statuses/update.json",
-                data={"status": text, "tweet_mode": "extended"},
-            )
-            return True
-        except XDuplicateTweet:
-            logger.warning("[XApi] duplicate tweet, skipping")
-            return False
-        except XAccountSuspended:
-            logger.error("[XApi] account suspended")
-            return False
-        except XRateLimited as e:
-            logger.warning(f"[XApi] tweet: rate limited, reset={e.reset_at}")
-            return False
-        except Exception as e:
-            logger.debug(f"[XApi] tweet error: {e}")
-            return False
+        return bool(await self.post_tweet(text))
 
     # ────────────────────────────────────────────
     # ブラウズ（タイムライン取得のみ、何もしない）
@@ -413,22 +442,31 @@ class XApiClient:
     # トークン有効確認
     # ────────────────────────────────────────────
 
-    async def verify(self) -> bool:
-        """auth_token が有効かどうかを確認する。"""
+    async def verify_state(self) -> str:
+        """ok / unauthorized / suspended / locked / error。凍結・ロックとトークン失効を区別する。"""
         try:
-            await self._get(
+            body = await self._get(
                 f"{_BASE}/1.1/account/verify_credentials.json",
                 params={"skip_status": "true", "include_entities": "false"},
             )
-            return True
+            if isinstance(body, dict) and body.get("suspended"):
+                return "suspended"
+            return "ok"
         except XUnauthorized:
-            return False
+            return "unauthorized"
         except XAccountSuspended:
-            return False
+            return "suspended"
         except XAccountLocked:
-            return False
+            return "locked"
+        except XForbidden:
+            # 403 はロック(326)/凍結(64)の本文コードが無いと区別できない → 不明扱い
+            return "error"
         except Exception:
-            return False
+            return "error"
+
+    async def verify(self) -> bool:
+        """auth_token が有効かどうか。"""
+        return await self.verify_state() == "ok"
 
     # ────────────────────────────────────────────
     # 出口 IP（プロキシとの一致確認用）
@@ -456,11 +494,11 @@ class XApiClient:
     # 検索（卒業テスト / シャドウバン判定用）
     # ────────────────────────────────────────────
 
-    async def _search_query_id(self) -> str:
-        """SearchTimeline の queryId。x.com の main.js から取得（キャッシュ）。失敗時は既知の値。"""
-        global _search_query_id_cache
-        if _search_query_id_cache:
-            return _search_query_id_cache
+    async def _query_id(self, operation: str) -> str:
+        """GraphQL の queryId を x.com の main.js から取得（キャッシュ）。失敗時は既知の値。
+        X-Utility/src/shadowban.ts が使っている ID を既定値にしている。"""
+        if operation in _query_id_cache:
+            return _query_id_cache[operation]
         try:
             s = self._open_session
             async with (nullcontext(s) if s else self._session()) as _s:
@@ -469,35 +507,80 @@ class XApiClient:
                 m = re.search(r'https://abs\.twimg\.com/responsive-web/client-web[^"\']*?/main\.[0-9a-z]+\.js', home.text)
                 if m:
                     js = (await s.get(m.group(0), headers={"User-Agent": _USER_AGENT})).text
-                    q = re.search(r'queryId:"([\w-]+)",operationName:"SearchTimeline"', js)
-                    if q:
-                        _search_query_id_cache = q.group(1)
-                        return _search_query_id_cache
+                    for op in _QUERY_ID_FALLBACK:
+                        q = re.search(r'queryId:"([\w-]+)",operationName:"%s"' % op, js)
+                        if q:
+                            _query_id_cache[op] = q.group(1)
         except Exception as e:
-            logger.debug(f"[XApi] SearchTimeline queryId lookup failed: {e}")
-        return _SEARCH_QUERY_ID_FALLBACK
+            logger.debug(f"[XApi] queryId lookup failed: {e}")
+        return _query_id_cache.setdefault(operation, _QUERY_ID_FALLBACK[operation])
+
+    async def _graphql(self, operation: str, variables: dict, features: dict, toggles: Optional[dict] = None) -> dict:
+        qid = await self._query_id(operation)
+        features = dict(features)
+        for _ in range(3):  # 「features が足りない」エラーには不足分を False で足して再試行
+            params = {"variables": json.dumps(variables, separators=(",", ":")),
+                      "features": json.dumps(features, separators=(",", ":"))}
+            if toggles:
+                params["fieldToggles"] = json.dumps(toggles, separators=(",", ":"))
+            body = await self._get(f"{_BASE}/graphql/{qid}/{operation}", params=params)
+            missing = _missing_features(body)
+            if not missing:
+                return body or {}
+            features.update({k: False for k in missing})
+        return {}
 
     async def search_timeline(self, query: str, product: str = "Top", count: int = 20) -> list[dict]:
         """
-        GraphQL SearchTimeline（twikit / twscrape と同じ呼び方）。
-        product: Top / Latest / People / Media。
-        戻り値: product が People なら {"screen_name", "name"}、それ以外は
-        {"id", "text", "screen_name"} のリスト（表示順＝検索順位）。
+        GraphQL SearchTimeline。product: Top / Latest / People / Media。
+        戻り値（表示順）: People なら {"screen_name","name"}、それ以外は
+        {"id","text","screen_name"}。
         """
-        qid = await self._search_query_id()
-        variables = {"rawQuery": query, "count": count, "querySource": "typed_query", "product": product}
-        features = dict(_SEARCH_FEATURES)
-        for _ in range(3):  # 「features が足りない」エラーには不足分を False で足して再試行
-            body = await self._get(
-                f"{_BASE}/graphql/{qid}/SearchTimeline",
-                params={"variables": json.dumps(variables, separators=(",", ":")),
-                        "features": json.dumps(features, separators=(",", ":"))},
-            )
-            missing = _missing_features(body)
-            if not missing:
-                return parse_search_results(body, people=(product == "People"))
-            features.update({k: False for k in missing})
-        return []
+        body = await self._graphql(
+            "SearchTimeline",
+            {"rawQuery": query, "count": count, "querySource": "typed_query", "product": product},
+            _SEARCH_FEATURES, _SEARCH_FIELD_TOGGLES,
+        )
+        return parse_search_results(body, people=(product == "People"))
+
+    async def typeahead_users(self, query: str) -> list[str]:
+        """検索ボックスのサジェスト（typeahead）に出たユーザーの screen_name 一覧。"""
+        body = await self._get(
+            f"{_BASE}/1.1/search/typeahead.json",
+            params={"include_ext_is_blue_verified": "1", "include_ext_verified_type": "1",
+                    "include_ext_profile_image_shape": "1", "q": query,
+                    "src": "search_box", "result_type": "events,users,topics,lists"},
+        )
+        users = body.get("users", []) if isinstance(body, dict) else []
+        return [u.get("screen_name", "") for u in users]
+
+    async def user_by_screen_name(self, screen_name: str) -> dict:
+        """
+        UserByScreenName。戻り値:
+          {"state": "ok"|"not_found"|"suspended"|"protected",
+           "screen_name","name","tweet_count"}
+        """
+        body = await self._graphql(
+            "UserByScreenName",
+            {"screen_name": screen_name, "withSafetyModeUserFields": True, "withGrokTranslatedBio": False},
+            _USER_FEATURES, {"withAuxiliaryUserLabels": False, "withPayments": False},
+        )
+        user = (body.get("data") or {}).get("user")
+        if not user:
+            return {"state": "not_found", "screen_name": screen_name, "name": screen_name, "tweet_count": None}
+        res = user.get("result") or {}
+        if res.get("__typename") != "User":
+            return {"state": "suspended", "screen_name": screen_name, "name": screen_name, "tweet_count": None}
+        legacy = res.get("legacy") or {}
+        core = res.get("core") or {}
+        sn = core.get("screen_name") or legacy.get("screen_name") or screen_name
+        name = core.get("name") or legacy.get("name") or sn
+        try:
+            cnt = int(legacy.get("statuses_count"))
+        except (TypeError, ValueError):
+            cnt = None
+        prot = legacy.get("protected") or (res.get("privacy") or {}).get("protected")
+        return {"state": "protected" if prot else "ok", "screen_name": sn, "name": name, "tweet_count": cnt}
 
     async def post_tweet(self, text: str) -> Optional[str]:
         """ツイートして tweet id を返す（失敗は None）。tweet() は bool 互換のまま残す。"""
@@ -507,7 +590,10 @@ class XApiClient:
                 data={"status": text, "tweet_mode": "extended"},
             )
             return str(body.get("id_str") or body.get("id") or "") or None
-        except (XDuplicateTweet, XAccountSuspended, XRateLimited) as e:
+        except XDuplicateTweet:
+            logger.warning("[XApi] duplicate tweet, skipping")
+        except (XAccountSuspended, XAccountLocked, XAutomated, XActionLimit, XRateLimited) as e:
+            self._note(e)
             logger.warning(f"[XApi] post_tweet: {type(e).__name__}")
         except Exception as e:
             logger.debug(f"[XApi] post_tweet error: {e}")
@@ -518,32 +604,82 @@ class XProxyIpLost(XApiError):
     """IPRoyal の killswitch（HTTP 410）: スティッキー IP が失われた。"""
 
 
-_SEARCH_QUERY_ID_FALLBACK = "flaR-PUMshxFWZWPNpq4zA"  # twikit の値（古くなり得る→main.js から取得）
-_search_query_id_cache: Optional[str] = None
-_SEARCH_FEATURES = {
-    "rweb_tipjar_consumption_enabled": True,
-    "responsive_web_graphql_exclude_directive_enabled": True,
-    "verified_phone_label_enabled": False,
+# X-Utility/src/shadowban.ts が観測している現行のID（古くなったら main.js から自動取得）
+_QUERY_ID_FALLBACK = {
+    "SearchTimeline": "hyPfJYJ_XAtDYoslQc-Rgg",
+    "UserByScreenName": "Gb-d6r0vxPOADdG62OEBpQ",
+}
+_query_id_cache: dict[str, str] = {}
+
+_USER_FEATURES = {
     "creator_subscriptions_tweet_preview_api_enabled": True,
+    "hidden_profile_subscriptions_enabled": True,
+    "highlights_tweets_tab_ui_enabled": True,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
     "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_profile_redirect_enabled": True,
+    "responsive_web_twitter_article_notes_tab_enabled": True,
+    "rweb_tipjar_consumption_enabled": False,
+    "subscriptions_feature_can_gift_premium": True,
+    "subscriptions_verification_info_is_identity_verified_enabled": True,
+    "subscriptions_verification_info_verified_since_enabled": True,
+    "verified_phone_label_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
     "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "communities_web_enable_tweet_community_results_fetch": True,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+}
+
+_SEARCH_FEATURES = {
     "articles_preview_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-    "tweet_awards_web_tipping_enabled": False,
-    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "content_disclosure_ai_generated_indicator_enabled": True,
+    "content_disclosure_indicator_enabled": True,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
     "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": False,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "post_ctas_fetch_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": False,
+    "responsive_web_grok_annotations_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": True,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_profile_redirect_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "rweb_cashtags_composer_attachment_enabled": True,
+    "rweb_cashtags_enabled": True,
+    "rweb_tipjar_consumption_enabled": False,
+    "rweb_video_screen_enabled": False,
     "standardized_nudges_misinfo": True,
     "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-    "rweb_video_timestamps_enabled": True,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "longform_notetweets_inline_media_enabled": True,
-    "responsive_web_enhance_cards_enabled": False,
+    "verified_phone_label_enabled": False,
+    "view_counts_everywhere_api_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "tweet_awards_web_tipping_enabled": False,
+}
+
+_SEARCH_FIELD_TOGGLES = {
+    "withArticlePlainText": False,
+    "withArticleRichContentState": True,
+    "withArticleSummaryText": False,
+    "withArticleVoiceOver": False,
+    "withAuxiliaryUserLabels": False,
+    "withDisallowedReplyControls": False,
+    "withGrokAnalyze": False,
+    "withPayments": False,
 }
 
 

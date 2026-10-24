@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-import httpx
 from loguru import logger
 
 from ..models import Account, AccountStatus
@@ -69,135 +68,48 @@ class BanStatus:
 
 class ShadowbanDetector:
     """
-    判定の主役は「別の垢（観測者）から実際に検索する」方式。
-    - ユーザー検索（People）でハンドルが出ない → search_ban
-    - from:ハンドル の最新検索が0件（ツイート済みなのに）→ search_ban
-    外部のシャドウバン確認サイトはレスポンス形式が不安定なので補助扱い。
-    どちらも得られない場合は unknown（=クリーン扱いにしない）。
+    X-Utility（shadowban.ts）と同じ判定を、登録済みの観測者（別の垢）で行う。
+      - `from:ユーザー名` の Top 検索に本人のポストが出ない → search_ban
+      - 検索候補(typeahead)に本人が出ない                    → search_ban
+    観測者が居ない／検索が失敗した時は unknown（クリーン扱いしない）。
+    以前使っていた外部サイト(hisubscriptions 等)とゲスト検索は、形式変更・廃止で
+    誤判定の原因だったため廃止した。
     """
 
-    def __init__(self, browser: BrowserManager, client_factory=None):
+    def __init__(self, browser: BrowserManager, observers=None, client_factory=None):
         self.browser = browser
+        self.observers = observers
         self._client_factory = client_factory
 
-    async def check(
-        self,
-        username: str,
-        observer=None,
-        observer_proxy_url: Optional[str] = None,
-        has_tweets: bool = True,
-    ) -> BanStatus:
+    async def check(self, username: str, has_tweets: bool = True) -> BanStatus:
         handle = username.lstrip("@")
-
-        # 1. 観測者の検索（主）
-        if observer is not None and self._client_factory is not None:
-            res = await self._check_via_observer(handle, observer, observer_proxy_url, has_tweets)
-            if res is not None:
-                logger.info(f"[@{handle}] shadowban (observer): search={res.search_ban}")
-                return res
-
-        # 2. 外部サイト（補助）
-        for fn, src in ((self._check_hisubscriptions, "hisubscriptions"),
-                        (self._check_shadowban_eu, "shadowban_eu")):
-            result = await fn(handle)
-            if result:
-                status = BanStatus(
-                    search_ban=result.get("search_ban", False),
-                    reply_ban=result.get("reply_ban", False),
-                    full_ban=result.get("ghost_ban", False),
-                    source=src,
-                )
-                logger.info(
-                    f"[@{handle}] shadowban ({src}): search={status.search_ban} "
-                    f"reply={status.reply_ban} full={status.full_ban}"
-                )
-                return status
-
-        logger.warning(f"[@{handle}] shadowban 判定材料なし → unknown")
-        return BanStatus(source="none", unknown=True)
-
-    async def _check_via_observer(
-        self, handle: str, observer, proxy_url: Optional[str], has_tweets: bool
-    ) -> Optional[BanStatus]:
+        if self.observers is None or self._client_factory is None:
+            return BanStatus(source="none", unknown=True)
+        observer = await self.observers.pick()
+        if observer is None:
+            logger.warning("shadowban check: 観測者が未登録 → unknown")
+            return BanStatus(source="none", unknown=True)
         try:
-            async with self._client_factory(observer, proxy_url) as obs:
-                people = await obs.search_timeline(handle, "People")
-                in_people = any(u["screen_name"].lower() == handle.lower() for u in people[:5])
-                if not people:
-                    return None  # 検索自体が空 = 観測者側の不調かもしれない。判定しない
-                search_ban = not in_people
-                if has_tweets and not search_ban:
-                    latest = await obs.search_timeline(f"from:{handle}", "Latest")
-                    search_ban = len(latest) == 0
-                return BanStatus(search_ban=search_ban, source="observer")
+            async with self._client_factory(observer, observer.proxy_url) as obs:
+                state = await obs.verify_state()
+                if state != "ok":
+                    await self.observers.report(observer, state)
+                    return BanStatus(source="observer", unknown=True)
+                user = await obs.user_by_screen_name(handle)
+                if user["state"] == "suspended":
+                    return BanStatus(full_ban=True, source="observer")
+                if user["state"] != "ok" or not user["tweet_count"]:
+                    return BanStatus(source="observer", unknown=True)  # 鍵/不在/投稿0は判定不能
+                real = user["screen_name"]
+                top = await obs.search_timeline(f"from:{real}", "Top")
+                in_top = any(t["screen_name"].lower() == real.lower() for t in top)
+                sugg = await obs.typeahead_users(f"@{real} {user['name']}")
+                in_sugg = any(u.lower() == real.lower() for u in sugg)
+                logger.info(f"[@{handle}] shadowban (observer): top={in_top} suggestion={in_sugg}")
+                return BanStatus(search_ban=not (in_top and in_sugg), source="observer")
         except Exception as e:
             logger.debug(f"[@{handle}] observer search error: {e}")
-            return None
-
-    # ──────────────────────────────────────────
-    # hisubscriptions
-    # ──────────────────────────────────────────
-
-    async def _check_hisubscriptions(self, handle: str) -> Optional[dict]:
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                r = await client.get(
-                    "https://hisubscriptions.com/api/shadowban",
-                    params={"screen_name": handle},
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    return {
-                        "search_ban": bool(data.get("has_search_ban") or data.get("search_ban")),
-                        "reply_ban": bool(data.get("has_ghost_ban") or data.get("reply_ban")),
-                        "ghost_ban": bool(data.get("has_ban") or data.get("ghost_ban")),
-                    }
-        except Exception as e:
-            logger.debug(f"[@{handle}] hisubscriptions error: {e}")
-        return None
-
-    # ──────────────────────────────────────────
-    # shadowban.eu 互換
-    # ──────────────────────────────────────────
-
-    async def _check_shadowban_eu(self, handle: str) -> Optional[dict]:
-        """
-        shadowban.eu の非公式 JSON エンドポイント。
-        レスポンス形式が変わりやすいので防御的に読む。
-        """
-        try:
-            url = f"https://shadowban.eu/.api/{handle}"
-            async with httpx.AsyncClient(
-                timeout=20.0,
-                follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-            ) as client:
-                r = await client.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    profile = data.get("profile", {})
-                    tests = data.get("tests", {})
-                    # shadowban.eu の tests フィールド構造
-                    search_ban = (
-                        tests.get("search", {}).get("ban")
-                        or tests.get("typeahead", {}).get("ban")
-                    )
-                    ghost_ban = (
-                        tests.get("ghost", {}).get("ban")
-                        or profile.get("sensitiveMediaSettings")
-                    )
-                    return {
-                        "search_ban": bool(search_ban),
-                        "reply_ban": bool(
-                            tests.get("more_replies", {}).get("ban")
-                        ),
-                        "ghost_ban": bool(ghost_ban),
-                    }
-        except Exception as e:
-            logger.debug(f"[@{handle}] shadowban.eu error: {e}")
-        return None
-
+            return BanStatus(source="observer", unknown=True)
 
 
 class ShadowbanResolver:

@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS vps_contract (
     updated_at TEXT NOT NULL
 );
 
+-- 観測者（検索を代行する"別の垢"）。トークンは暗号化して保存する。
+CREATE TABLE IF NOT EXISTS observers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL DEFAULT '',
+    auth_token_enc TEXT NOT NULL,
+    ct0_enc TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unverified',  -- unverified / ok / invalid / suspended / locked
+    last_error TEXT,
+    last_checked_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 -- 卒業テスト（ウォームアップ完了→検索TOP掲載の確認）の状態と結果
 CREATE TABLE IF NOT EXISTS graduation (
     account_id INTEGER PRIMARY KEY,
@@ -242,6 +255,38 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ── 観測者 ──
+
+    async def add_observer(self, label: str, auth_token_enc: str, ct0_enc: str) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO observers (label, auth_token_enc, ct0_enc, created_at) VALUES (?,?,?,?)",
+            (label, auth_token_enc, ct0_enc, datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def list_observers(self) -> List[dict]:
+        rows = await (await self.conn.execute("SELECT * FROM observers ORDER BY id")).fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_observer(self, observer_id: int) -> Optional[dict]:
+        row = await (await self.conn.execute("SELECT * FROM observers WHERE id = ?", (observer_id,))).fetchone()
+        return dict(row) if row else None
+
+    async def update_observer(self, observer_id: int, **fields) -> None:
+        allowed = {"label", "auth_token_enc", "ct0_enc", "status", "last_error",
+                   "last_checked_at", "last_used_at"}
+        if set(fields) - allowed:
+            raise ValueError("unknown observer fields")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await self.conn.execute(f"UPDATE observers SET {sets} WHERE id = ?", (*fields.values(), observer_id))
+        await self.conn.commit()
+
+    async def delete_observer(self, observer_id: int) -> bool:
+        cur = await self.conn.execute("DELETE FROM observers WHERE id = ?", (observer_id,))
+        await self.conn.commit()
+        return cur.rowcount > 0
 
     # ── 卒業テスト ──
 

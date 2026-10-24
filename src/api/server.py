@@ -36,6 +36,7 @@ from ..config import load_config, AppConfig
 from ..db import Database
 from ..models import AccountStatus
 from ..proxy.manager import ProxyManager
+from ..observers import ObserverPool
 
 _MAX_SKEW_MS = 5 * 60_000
 _NONCE_LIFETIME_MS = _MAX_SKEW_MS
@@ -124,6 +125,7 @@ async def _lifespan(app: FastAPI):
     await _state.db.connect()
     # オーケストレーターと共有する唯一のProxyManager（状態ファイルの上書き競合を防ぐ）
     _state.proxy_manager = ProxyManager(_state.config.proxy)
+    _state.observers = ObserverPool(_state.db, _state.proxy_manager, _state.config.twofa.encryption_key)
     yield
     await _state.db.close()
     if _state._orchestrator_task and not _state._orchestrator_task.done():
@@ -279,6 +281,45 @@ async def pop_accounts(request: Request, body_model: PopRequest):
         })
 
     return {"ok": True, "popped": len(results), "accounts": results}
+
+
+class ObserverRequest(BaseModel):
+    label: str = ""
+    auth_token: str
+    ct0: str
+
+
+@app.get("/api/generator/observers")
+async def list_observers(request: Request):
+    await _verify_request(request, await request.body())
+    return {"observers": await _state.observers.list()}
+
+
+@app.post("/api/generator/observers")
+async def add_observer(request: Request, body_model: ObserverRequest):
+    await _verify_request(request, await request.body())
+    try:
+        return {"ok": True, "observer": await _state.observers.add(
+            body_model.label, body_model.auth_token, body_model.ct0)}
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+
+
+@app.post("/api/generator/observers/{observer_id}/verify")
+async def verify_observer(request: Request, observer_id: int):
+    await _verify_request(request, await request.body())
+    try:
+        return {"ok": True, "observer": await _state.observers.verify(observer_id)}
+    except KeyError:
+        raise HTTPException(404, detail="OBSERVER_NOT_FOUND")
+
+
+@app.delete("/api/generator/observers/{observer_id}")
+async def delete_observer(request: Request, observer_id: int):
+    await _verify_request(request, await request.body())
+    if not await _state.observers.remove(observer_id):
+        raise HTTPException(404, detail="OBSERVER_NOT_FOUND")
+    return {"ok": True}
 
 
 @app.get("/api/generator/graduation")

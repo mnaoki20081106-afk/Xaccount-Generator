@@ -1,25 +1,22 @@
 """
 卒業テスト — ウォームアップ完了後に「売れる垢か」を実測で判定する。
 
-静的な条件（経過日数・行動量）だけでなく、以下を実際に確認する:
-  1. プロキシ: 生成時と同じ出口 IP で運用できている（想定外の IP 変化なし）
-  2. 生存:   本人のトークンで verify_credentials が通る
-  3. 検索:   別の垢（観測者）から見て
-       a) 一意トークン入りの canary ツイートが「話題 (Top)」検索に出る
-       b) from:ユーザー名 の「最新」検索に canary が出る
-       c) 「ユーザー」検索でユーザー名が上位に出る
-     自分視点の検索は BAN 垢でも見えてしまうため、必ず別垢で見る。
+検索の判定は X-Utility（shadowban.ts）の確認方式を採用:
+  - searchBan:        観測者で `from:ユーザー名` を「話題(Top)」検索 → 本人のポストが出るか
+  - searchSuggestion: 観測者で検索候補(typeahead) `@ユーザー名 表示名` → 本人が出るか
+観測者は管理サイトから登録した別の垢（src/observers.py）。自分視点の検索は
+BAN垢でも見えてしまうため、必ず別垢で見る。
 
-canary は投稿→数分待ってから検索（インデックス待ち）の2段階。状態は DB の
-graduation テーブルに持つので、プロセスが落ちても続きから再開できる。
-観測者がいない／検索が失敗した場合は "unknown" とし、合格にはしない（甘く通さない）。
+静的な条件（経過日数・行動日数・ツイート数）に加え、
+  - プロキシ: 生成時と同じ出口 IP で運用できている（想定外の IP 変化なし）
+  - 生存:     本人のトークンで verify_credentials が通る（凍結/ロックは状態に反映）
+  - ユーザー: 存在し、非凍結・非鍵・投稿が1件以上
+も確認する。観測者がいない／検索が失敗した場合は "unknown" とし、合格にしない。
+結果は DB の graduation テーブルに保存。
 """
 from __future__ import annotations
 
 import json
-import random
-import secrets
-import string
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -29,10 +26,7 @@ from loguru import logger
 from .config import WarmupConfig
 from .models import Account, AccountStatus
 
-CANARY_INDEX_WAIT = timedelta(minutes=4)    # 投稿からこの時間は検索しない（インデックス待ち）
-CANARY_GIVE_UP = timedelta(minutes=30)      # これを過ぎても出なければ不合格として扱う
-CANARY_RETRY_BACKOFF = timedelta(hours=6)   # 不合格後に次の canary を投げるまでの間隔
-PEOPLE_RANK_LIMIT = 3                       # ユーザー検索でこの順位以内なら合格
+RETRY_BACKOFF = timedelta(hours=6)   # 不合格後、次の判定までの間隔（一時的な不調で連続不合格にしない）
 
 _NOT_GRADUATABLE = {
     AccountStatus.SOLD, AccountStatus.SUSPENDED, AccountStatus.LOCKED,
@@ -71,32 +65,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def new_canary_token() -> str:
-    # 英小文字のみ・先頭固定語: 検索で他のツイートと衝突せず、スパム判定もされにくい形
-    return "kk" + "".join(secrets.choice(string.ascii_lowercase) for _ in range(9))
-
-
-def canary_text(token: str) -> str:
-    return random.choice([
-        "メモ {t}", "今日の記録 {t}", "ふと思ったこと {t}", "{t} これ覚えておこう",
-    ]).format(t=token)
-
-
 class GraduationExaminer:
-    def __init__(
-        self,
-        db,
-        proxy_manager,
-        config: WarmupConfig,
-        client_factory: Optional[Callable] = None,
-    ):
+    def __init__(self, db, proxy_manager, config: WarmupConfig, observers, client_factory: Optional[Callable] = None):
         self.db = db
         self.proxy_manager = proxy_manager
         self.config = config
+        self.observers = observers
         if client_factory is None:
             from .actions.x_api import XApiClient
 
-            def client_factory(acc: Account, proxy_url: str):
+            def client_factory(acc, proxy_url: str):
                 return XApiClient(acc.auth_token, acc.ct0, proxy_url=proxy_url)
         self._client_factory = client_factory
 
@@ -118,23 +96,6 @@ class GraduationExaminer:
                   "auth_token/ct0 " + ("あり" if account.auth_token and account.ct0 else "なし")),
         ]
 
-    # ── 観測者（別の垢から検索する） ──────────────────────────────
-
-    async def pick_observer(self, target: Account) -> Optional[Account]:
-        pool = await self.db.list_accounts(status=AccountStatus.CLEAN, limit=1000)
-        graduated = await self.db.graduated_account_ids()
-        cands = [
-            a for a in pool
-            if a.id != target.id and a.auth_token and a.ct0
-            and a.proxy_id != target.proxy_id  # 同一 IP だと関連垢として同一視され得る
-            and (a.id in graduated or (_now() - _aware(a.created_at)).days >= 14)
-        ]
-        if not cands:
-            return None
-        cands.sort(key=lambda a: a.id not in graduated)  # 卒業済み（実績あり）を優先
-        top = [a for a in cands if (a.id in graduated) == (cands[0].id in graduated)]
-        return random.choice(top)
-
     # ── 本体 ──────────────────────────────────────────────────
 
     async def examine(self, account: Account) -> GraduationReport:
@@ -152,65 +113,45 @@ class GraduationExaminer:
         attempts = grad.get("attempts", 0)
         if attempts >= self.config.graduation_max_attempts:
             return GraduationReport("failed", checks + [Check("attempts", "fail", f"{attempts}回不合格")])
+        if grad.get("checked_at") and attempts and _now() - _aware(datetime.fromisoformat(grad["checked_at"])) < RETRY_BACKOFF:
+            return GraduationReport("pending", checks + [Check("retry", "unknown", "前回不合格から間隔待ち")])
 
         # 1. プロキシ（IP 一致）
         ip = await self.proxy_manager.verify_account_ip(account)
         sess = self.proxy_manager.proxy_for_account(account)
         unplanned = ip.get("unplanned_changes", sess.unplanned_ip_changes)
         if ip["kind"] == "unreachable":
-            checks.append(Check("proxy_ip", "unknown", "プロキシに接続できない"))
-        elif unplanned > self.config.graduation_max_unplanned_ip_changes:
+            return GraduationReport("pending", checks + [Check("proxy_ip", "unknown", "プロキシに接続できない")])
+        if unplanned > self.config.graduation_max_unplanned_ip_changes:
             checks.append(Check("proxy_ip", "fail", f"想定外のIP変化 {unplanned}回 (許容 {self.config.graduation_max_unplanned_ip_changes})"))
-        else:
-            checks.append(Check("proxy_ip", "pass", f"signup={ip.get('signup_ip')} now={ip.get('ip')}"))
-        if checks[-1].status != "pass":
-            return GraduationReport("pending" if checks[-1].status == "unknown" else "failed", checks)
+            return GraduationReport("failed", checks)
+        checks.append(Check("proxy_ip", "pass", f"signup={ip.get('signup_ip')} now={ip.get('ip')}"))
 
-        proxy_url = sess.url
-        async with self._client_factory(account, proxy_url) as me:
-            # 2. 生存
-            if not await me.verify():
-                checks.append(Check("alive", "fail", "verify_credentials が通らない（凍結/ロック/失効）"))
-                return GraduationReport("failed", checks)
-            checks.append(Check("alive", "pass"))
-
-            # 3. canary 投稿（まだなら投稿して次回へ）
-            token = grad.get("canary_token")
-            posted_at = _aware(datetime.fromisoformat(grad["canary_posted_at"])) if grad.get("canary_posted_at") else None
-            need_new = (
-                not token or not posted_at
-                or (_now() - posted_at > CANARY_GIVE_UP + CANARY_RETRY_BACKOFF)
+        # 2. 生存（本人のトークン）
+        async with self._client_factory(account, sess.url) as me:
+            state = await me.verify_state()
+        if state in ("suspended", "locked"):
+            await self.db.update_status(
+                account.id, AccountStatus.SUSPENDED if state == "suspended" else AccountStatus.LOCKED
             )
-            if need_new:
-                token = new_canary_token()
-                tid = await me.post_tweet(canary_text(token))
-                if not tid:
-                    checks.append(Check("canary_post", "unknown", "canary を投稿できなかった"))
-                    return GraduationReport("pending", checks)
-                await self.db.save_graduation(
-                    account.id, canary_token=token, canary_tweet_id=tid,
-                    canary_posted_at=_now().isoformat(),
-                )
-                await self.db.log_action(account.id, "canary", f"{tid}|{token}")
-                checks.append(Check("canary_post", "pass", f"id={tid}"))
-                return GraduationReport("pending", checks + [Check("search", "unknown", "インデックス待ち")])
+            checks.append(Check("alive", "fail", state))
+            return GraduationReport("failed", checks)
+        if state != "ok":
+            checks.append(Check("alive", "fail" if state == "unauthorized" else "unknown", state))
+            return GraduationReport("failed" if state == "unauthorized" else "pending", checks)
+        checks.append(Check("alive", "pass"))
 
-            if _now() - posted_at < CANARY_INDEX_WAIT:
-                return GraduationReport("pending", checks + [Check("search", "unknown", "インデックス待ち")])
-            canary_id = grad.get("canary_tweet_id")
-
-        # 4. 別垢から検索
-        observer = await self.pick_observer(account)
+        # 3. 観測者から検索（X-Utility と同じ判定）
+        observer = await self.observers.pick()
         if not observer:
-            checks.append(Check("search", "unknown", "観測者にできる垢がない（CLEAN で別IPの垢が必要）"))
+            checks.append(Check("search", "unknown", "観測者が未登録（管理サイトで観測者のauth_token/ct0を登録）"))
             return GraduationReport("pending", checks)
-        obs_proxy = self.proxy_manager.proxy_for_account(observer)
-        search_checks = await self._search_checks(observer, obs_proxy.url, account.username, token, canary_id)
-        checks += search_checks
+        search = await self._search_checks(observer, account.username)
+        checks += search
 
-        if any(c.status == "unknown" for c in search_checks):
+        if any(c.status == "unknown" for c in search):
             return GraduationReport("pending", checks)
-        if all(c.status == "pass" for c in search_checks):
+        if all(c.status == "pass" for c in search):
             await self.db.save_graduation(
                 account.id, passed=1, report=GraduationReport("passed", checks).to_json(),
                 checked_at=_now().isoformat(),
@@ -218,12 +159,9 @@ class GraduationExaminer:
             logger.success(f"[@{account.username}] 卒業テスト合格")
             return GraduationReport("passed", checks)
 
-        # 不合格: インデックスの遅れかもしれないので猶予内は pending のまま
-        if _now() - posted_at < CANARY_GIVE_UP:
-            return GraduationReport("pending", checks)
         attempts += 1
         await self.db.save_graduation(
-            account.id, attempts=attempts, canary_posted_at=(_now() - CANARY_GIVE_UP).isoformat(),
+            account.id, attempts=attempts,
             report=GraduationReport("failed", checks).to_json(), checked_at=_now().isoformat(),
         )
         logger.warning(f"[@{account.username}] 卒業テスト不合格 ({attempts}/{self.config.graduation_max_attempts})")
@@ -231,30 +169,35 @@ class GraduationExaminer:
             await self.db.update_status(account.id, AccountStatus.SOFT_SHADOW)
         return GraduationReport("failed", checks)
 
-    async def _search_checks(
-        self, observer: Account, proxy_url: str, handle: str, token: str, canary_id: Optional[str]
-    ) -> list[Check]:
-        handle_l = handle.lstrip("@").lower()
-        out: list[Check] = []
+    async def _search_checks(self, observer, username: str) -> list[Check]:
+        handle = username.lstrip("@")
         try:
-            async with self._client_factory(observer, proxy_url) as obs:
-                top = await obs.search_timeline(token, "Top")
-                found = any(t["id"] == canary_id or token in t["text"] for t in top)
-                out.append(Check("search_top", "pass" if found else "fail",
-                                 "canary が話題検索に表示" if found else f"話題検索に出ない（{len(top)}件中）"))
+            async with self._client_factory(observer, observer.proxy_url) as obs:
+                state = await obs.verify_state()
+                if state != "ok":
+                    await self.observers.report(observer, state)
+                    return [Check("search", "unknown", f"観測者 #{observer.id} が使えない: {state}")]
 
-                latest = await obs.search_timeline(f"from:{handle_l}", "Latest")
-                found = any(t["id"] == canary_id or token in t["text"] for t in latest)
-                out.append(Check("search_from_latest", "pass" if found else "fail",
-                                 "from: 最新に表示" if found else f"from: 最新に出ない（{len(latest)}件中）"))
+                user = await obs.user_by_screen_name(handle)
+                if user["state"] != "ok":
+                    return [Check("user", "fail", {"not_found": "ユーザーが見つからない",
+                                                   "suspended": "凍結されている",
+                                                   "protected": "鍵アカウント"}[user["state"]])]
+                if not user["tweet_count"]:
+                    return [Check("user", "fail", "投稿が0件のため検索確認ができない")]
+                out = [Check("user", "pass", f"投稿 {user['tweet_count']}件")]
+                real = user["screen_name"]
 
-                people = await obs.search_timeline(handle_l, "People")
-                rank = next((i + 1 for i, u in enumerate(people)
-                             if u["screen_name"].lower() == handle_l), None)
-                ok = rank is not None and rank <= PEOPLE_RANK_LIMIT
-                out.append(Check("search_people", "pass" if ok else "fail",
-                                 f"ユーザー検索 {rank}位" if rank else "ユーザー検索に出ない"))
+                top = await obs.search_timeline(f"from:{real}", "Top")
+                own = any(t["screen_name"].lower() == real.lower() for t in top)
+                out.append(Check("search_top", "pass" if own else "fail",
+                                 "Top検索に本人のポストを確認" if own else "Top検索に本人のポストが見つからない"))
+
+                sugg = await obs.typeahead_users(f"@{real} {user['name']}")
+                found = any(u.lower() == real.lower() for u in sugg)
+                out.append(Check("search_suggestion", "pass" if found else "fail",
+                                 "検索候補に本人を確認" if found else "検索候補に本人が見つからない"))
+                return out
         except Exception as e:
-            logger.warning(f"[@{handle_l}] 検索チェック失敗: {e}")
-            out.append(Check("search", "unknown", f"検索API失敗: {type(e).__name__}"))
-        return out
+            logger.warning(f"[@{handle}] 検索チェック失敗: {e}")
+            return [Check("search", "unknown", f"検索API失敗: {type(e).__name__}")]

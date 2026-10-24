@@ -8,6 +8,7 @@ from src.actions.x_api import _missing_features, parse_search_results
 from src.config import ProxyConfig, WarmupConfig
 from src.db import Database
 from src.detector import BanStatus, ShadowbanDetector
+from src.observers import ObserverPool
 from src.graduation import GraduationExaminer
 from src.models import Account, AccountStatus
 from src.proxy import manager as pm
@@ -92,25 +93,18 @@ def test_parse_search_results_and_missing_features():
     assert _missing_features({"errors": [{"message": "The following features cannot be null: a_b, c"}]}) == ["a_b", "c"]
 
 
-def test_detector_unknown_when_no_source(monkeypatch):
-    det = ShadowbanDetector(None)
-
-    async def none(handle):
-        return None
-
-    monkeypatch.setattr(det, "_check_hisubscriptions", none)
-    monkeypatch.setattr(det, "_check_shadowban_eu", none)
-    st = asyncio.run(det.check("foo"))
+def test_detector_unknown_without_observers():
+    st = asyncio.run(ShadowbanDetector(None).check("foo"))
     assert st.unknown and not st.is_clean
 
 
-# ── 卒業テスト ─────────────────────────────────────────────────
+# ── 卒業テスト / 観測者（X-Utility 方式） ─────────────────────────
 
 class FakeClient:
-    """search_results: {(query, product): [..]}"""
-    posted: list = []
-    search_results: dict = {}
-    alive = True
+    users: dict = {}        # screen_name -> user_by_screen_name result
+    top: dict = {}          # query -> results
+    suggest: list = []
+    state = "ok"
 
     def __init__(self, acc, proxy_url):
         self.acc = acc
@@ -121,15 +115,17 @@ class FakeClient:
     async def __aexit__(self, *a):
         pass
 
-    async def verify(self):
-        return self.alive
+    async def verify_state(self):
+        return FakeClient.state
 
-    async def post_tweet(self, text):
-        FakeClient.posted.append(text)
-        return "999"
+    async def user_by_screen_name(self, sn):
+        return FakeClient.users.get(sn, {"state": "not_found", "screen_name": sn, "name": sn, "tweet_count": None})
 
     async def search_timeline(self, q, product="Top", count=20):
-        return FakeClient.search_results.get((q, product), [])
+        return FakeClient.top.get((q, product), [])
+
+    async def typeahead_users(self, q):
+        return FakeClient.suggest
 
 
 class FakeProxyMgr:
@@ -146,49 +142,67 @@ class FakeProxyMgr:
             unplanned_ip_changes = self.unplanned
         return S()
 
+    def get_warmup_proxy(self, key):
+        class S:
+            url = "http://obs"
+        return S()
+
 
 @pytest.fixture
 def env(tmp_path):
-    FakeClient.posted, FakeClient.search_results, FakeClient.alive = [], {}, True
+    FakeClient.users = {"target": {"state": "ok", "screen_name": "target", "name": "Tgt", "tweet_count": 12}}
+    FakeClient.top = {("from:target", "Top"): [{"id": "1", "text": "hi", "screen_name": "target"}]}
+    FakeClient.suggest = ["target"]
+    FakeClient.state = "ok"
 
-    async def build(mgr=None):
+    async def build(mgr=None, observer=True):
         db = Database(str(tmp_path / "a.db"))
         await db.connect()
         old = datetime.now(timezone.utc) - timedelta(days=30)
-        ids = []
-        for n, pid in (("target", "s1"), ("observer", "s2")):
-            a = Account(username=n, password="x", auth_token="t", ct0="c", status=AccountStatus.CLEAN,
-                        proxy_id=pid, created_at=old)
-            ids.append(await db.add_account(a))
+        aid = await db.add_account(Account(username="target", password="x", auth_token="t", ct0="c",
+                                           status=AccountStatus.CLEAN, proxy_id="s1", created_at=old))
         for _ in range(12):
-            await db.log_action(ids[0], "tweets", "t")
-        # 行動した日を10日分
+            await db.log_action(aid, "tweets", "t")
         for d in range(10):
-            ts = (old + timedelta(days=d)).isoformat()
             await db.conn.execute("INSERT INTO action_log (account_id, action, detail, created_at) VALUES (?,?,?,?)",
-                                  (ids[0], "likes", "1", ts))
+                                  (aid, "likes", "1", (old + timedelta(days=d)).isoformat()))
         await db.conn.commit()
-        cfg = WarmupConfig()
-        ex = GraduationExaminer(db, mgr or FakeProxyMgr(), cfg, client_factory=FakeClient)
-        return db, ex, await db.get_account_by_id(ids[0]), ids
+        pm = mgr or FakeProxyMgr()
+        pool = ObserverPool(db, pm, "k" * 32, client_factory=FakeClient)
+        if observer:
+            await pool.add("obs1", "AUTH", "CT0")
+        ex = GraduationExaminer(db, pm, WarmupConfig(), pool, client_factory=FakeClient)
+        return db, ex, pool, await db.get_account_by_id(aid)
 
     return build
 
 
-def test_graduation_full_flow_pass(env):
+def test_observer_tokens_encrypted_and_hidden(env):
     async def run():
-        db, ex, acc, ids = await env()
-        r1 = await ex.examine(acc)
-        assert r1.stage == "pending" and len(FakeClient.posted) == 1
-        token = (await db.get_graduation(acc.id))["canary_token"]
-        # インデックス待ちは pending のまま
-        assert (await ex.examine(acc)).stage == "pending"
-        await db.save_graduation(acc.id, canary_posted_at=(datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat())
-        FakeClient.search_results = {
-            (token, "Top"): [{"id": "999", "text": f"メモ {token}", "screen_name": "target"}],
-            ("from:target", "Latest"): [{"id": "999", "text": f"メモ {token}", "screen_name": "target"}],
-            ("target", "People"): [{"screen_name": "Target", "name": "t"}],
-        }
+        db, ex, pool, acc = await env()
+        rows = await db.list_observers()
+        assert "AUTH" not in rows[0]["auth_token_enc"] and rows[0]["status"] == "ok"
+        listed = await pool.list()
+        assert "auth_token_enc" not in listed[0] and "auth_token" not in listed[0]
+        obs = await pool.pick()
+        assert (obs.auth_token, obs.ct0) == ("AUTH", "CT0")
+        await db.close()
+    asyncio.run(run())
+
+
+def test_invalid_observer_is_not_picked(env):
+    async def run():
+        FakeClient.state = "unauthorized"
+        db, ex, pool, acc = await env()
+        assert (await pool.list())[0]["status"] == "invalid"
+        assert await pool.pick() is None
+        await db.close()
+    asyncio.run(run())
+
+
+def test_graduation_pass(env):
+    async def run():
+        db, ex, pool, acc = await env()
         r = await ex.examine(acc)
         assert r.stage == "passed", r.to_json()
         assert acc.id in await db.graduated_account_ids()
@@ -196,15 +210,34 @@ def test_graduation_full_flow_pass(env):
     asyncio.run(run())
 
 
-def test_graduation_fails_when_not_in_search(env):
+def test_graduation_fails_when_missing_from_top_search(env):
     async def run():
-        db, ex, acc, ids = await env()
-        await ex.examine(acc)
-        await db.save_graduation(acc.id, canary_posted_at=(datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat())
-        FakeClient.search_results = {("target", "People"): [{"screen_name": "someone", "name": ""}]}
+        FakeClient.top = {}
+        db, ex, pool, acc = await env()
         r = await ex.examine(acc)
         assert r.stage == "failed"
         assert (await db.get_graduation(acc.id))["attempts"] == 1
+        # 直後の再判定は間隔待ち（一時不調で連続不合格にしない）
+        assert (await ex.examine(acc)).stage == "pending"
+        await db.close()
+    asyncio.run(run())
+
+
+def test_graduation_fails_when_missing_from_suggestion(env):
+    async def run():
+        FakeClient.suggest = ["someone_else"]
+        db, ex, pool, acc = await env()
+        r = await ex.examine(acc)
+        assert r.stage == "failed" and any(c.name == "search_suggestion" and c.status == "fail" for c in r.checks)
+        await db.close()
+    asyncio.run(run())
+
+
+def test_graduation_pending_without_observer(env):
+    async def run():
+        db, ex, pool, acc = await env(observer=False)
+        r = await ex.examine(acc)
+        assert r.stage == "pending" and any(c.status == "unknown" for c in r.checks)
         assert acc.id not in await db.graduated_account_ids()
         await db.close()
     asyncio.run(run())
@@ -212,29 +245,27 @@ def test_graduation_fails_when_not_in_search(env):
 
 def test_graduation_blocks_on_unplanned_ip_change(env):
     async def run():
-        db, ex, acc, ids = await env(FakeProxyMgr(kind="same", unplanned=1))
-        r = await ex.examine(acc)
-        assert r.stage == "failed" and FakeClient.posted == []
-        await db.close()
-    asyncio.run(run())
-
-
-def test_graduation_unknown_without_observer(env):
-    async def run():
-        db, ex, acc, ids = await env()
-        await db.update_status(ids[1], AccountStatus.WARMING)  # 観測者がいなくなる
-        await ex.examine(acc)
-        await db.save_graduation(acc.id, canary_posted_at=(datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat())
-        r = await ex.examine(acc)
-        assert r.stage == "pending" and any(c.status == "unknown" for c in r.checks)
+        db, ex, pool, acc = await env(FakeProxyMgr(unplanned=1))
+        assert (await ex.examine(acc)).stage == "failed"
         await db.close()
     asyncio.run(run())
 
 
 def test_not_ready_when_young(env):
     async def run():
-        db, ex, acc, ids = await env()
+        db, ex, pool, acc = await env()
         acc.created_at = datetime.now(timezone.utc)
         assert (await ex.examine(acc)).stage == "not_ready"
+        await db.close()
+    asyncio.run(run())
+
+
+def test_detector_via_observer(env):
+    async def run():
+        db, ex, pool, acc = await env()
+        det = ShadowbanDetector(None, pool, client_factory=FakeClient)
+        assert (await det.check("target")).is_clean
+        FakeClient.top = {}
+        assert (await det.check("target")).search_ban
         await db.close()
     asyncio.run(run())

@@ -24,6 +24,7 @@ from .actions.like import LikeAction
 from .warmup import WarmupScheduler, is_active_hour
 from .detector import ShadowbanDetector, ShadowbanResolver
 from .graduation import GraduationExaminer
+from .observers import ObserverPool
 
 _ALL = 100000  # list_accounts の既定 limit=100 だと101垢目以降が処理されないため
 
@@ -77,7 +78,8 @@ class Orchestrator:
             self.twofa_manager,
             self.browser,
         )
-        self.detector = ShadowbanDetector(self.browser, client_factory=self._api_client)
+        self.observers = ObserverPool(self.db, self.proxy_manager, config.twofa.encryption_key)
+        self.detector = ShadowbanDetector(self.browser, self.observers, client_factory=self._api_client)
         self.resolver = ShadowbanResolver(
             self.browser, self.login_action, self.tweet_action, self.like_action
         )
@@ -90,7 +92,7 @@ class Orchestrator:
             self.like_action,
             db=self.db,
         )
-        self.graduation = GraduationExaminer(self.db, self.proxy_manager, config.warmup)
+        self.graduation = GraduationExaminer(self.db, self.proxy_manager, config.warmup, self.observers)
 
     @staticmethod
     def _api_client(account: Account, proxy_url: str | None):
@@ -201,13 +203,7 @@ class Orchestrator:
 
         async def _check_one(account: Account):
             async with sem:
-                observer = await self.graduation.pick_observer(account)
-                obs_proxy = self.proxy_manager.proxy_for_account(observer).url if observer else None
-                stats = await self.db.action_stats(account.id)
-                ban_status = await self.detector.check(
-                    account.username, observer=observer, observer_proxy_url=obs_proxy,
-                    has_tweets=stats["counts"].get("tweets", 0) > 0,
-                )
+                ban_status = await self.detector.check(account.username)
                 if ban_status.unknown:
                     return  # 判定できなかった垢は状態を動かさない
                 await self.db.update_shadow_score(account.id, ban_status.shadow_score)
