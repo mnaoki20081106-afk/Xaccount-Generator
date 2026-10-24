@@ -8,7 +8,6 @@ class AccountStatus(str, Enum):
     CREATED = "created"
     WARMING = "warming"
     CLEAN = "clean"
-    GRADUATED = "graduated"     # ウォームアップ完了、検索TOP表示を確認済み
     SOFT_SHADOW = "soft_shadow"
     HARD_SHADOW = "hard_shadow"
     LOCKED = "locked"
