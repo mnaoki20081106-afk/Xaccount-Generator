@@ -272,11 +272,10 @@ def test_detector_via_observer(env):
 
 
 def test_failed_signup_returns_ip_slot(mgr):
-    mgr.config.max_accounts_per_ip = 2
-    s = mgr.get_proxy_for_account("a")
-    mgr.get_proxy_for_account("b")  # 同じセッションに2垢目 → 上限でクーリング
+    mgr.config.max_accounts_per_ip = 1
+    s = mgr.get_proxy_for_account("a")  # 上限1 → 即クーリングに入る
     assert mgr._sessions[s.session_id]["cooldown_until"]
-    mgr.release_failed_signup("b")
+    mgr.release_failed_signup("a")
     d = mgr._sessions[s.session_id]
-    assert d["account_count"] == 1 and d["cooldown_until"] is None
-    assert "b" not in mgr._account_map
+    assert d["account_count"] == 0 and d["cooldown_until"] is None
+    assert "a" not in mgr._account_map
