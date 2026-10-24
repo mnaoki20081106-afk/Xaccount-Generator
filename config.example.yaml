@@ -2,7 +2,7 @@
 # cp config.example.yaml config.yaml して値を埋める
 
 proxy:
-  provider: "iproyal"          # iproyal / proxycheap / brightdata
+  provider: "iproyal"          # iproyal / statesideip / proxycheap / brightdata（statesideipはスティッキー最大30分）
   host: "geo.iproyal.com"
   port: 12321
   username: "YOUR_PROXY_USER"
@@ -22,6 +22,7 @@ factory:
   max_per_hour: 5              # 1時間の最大生成数（多すぎると凍結）
   use_phone: true              # SMS電話番号認証 (必須)
   setup_profile: true          # サインアップ後にプロフィール（アイコン・bio）を設定
+  enroll_2fa: true             # サインアップ後にX側で2FA(認証アプリ)を有効化。失敗時は2FAなしで納品
 
 sms:
   # provider: "5sim" が最安。ダメなら "smsactivate" に切り替え。

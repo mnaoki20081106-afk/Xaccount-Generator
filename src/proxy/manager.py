@@ -172,6 +172,14 @@ class ProxySession:
             if c.killswitch:
                 pw += "_killswitch-1"
             user = c.username
+        elif c.provider.lower() == "statesideip":
+            # StatesideIP: ユーザー名に country → session → ttl の順で `-key-value` を連結する。
+            # ttl は最大30分（IPはそれより早く変わることがある）。
+            user = c.username
+            if c.country:
+                user += f"-country-{c.country}"
+            user += f"-session-{sid}-ttl-{min(c.session_lifetime_minutes, 30)}"
+            pw = c.password
         else:
             user = f"{c.username}-session-{sid}"
             if c.country:

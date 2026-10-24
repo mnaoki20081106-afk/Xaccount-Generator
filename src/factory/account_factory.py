@@ -134,7 +134,7 @@ class AccountFactory:
 
     async def _enroll_2fa(self, username: str, auth_token, ct0, proxy_url: str) -> str | None:
         """X 側で 2FA を有効化し、暗号化した秘密鍵を返す。失敗時は None（未登録の鍵は渡さない）。"""
-        if not self.config.twofa.enabled or not auth_token or not ct0:
+        if not (self.config.twofa.enabled and self.config.factory.enroll_2fa) or not auth_token or not ct0:
             return None
         from ..auth.twofa_enroll import enable_totp_2fa
         context = None

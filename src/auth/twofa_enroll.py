@@ -38,31 +38,58 @@ def decode_qr_secret(png_bytes: bytes) -> Optional[str]:
     return parse_totp_secret(data) if data else None
 
 
-async def enable_totp_2fa(page, *, step_wait_ms: int = 1000, confirm_wait_ms: int = 4000) -> Optional[str]:
-    """ログイン済みの page で 2FA を有効化する。成功時のみ平文の secret を返す。"""
-    await page.goto(LOGIN_VERIFICATION_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(step_wait_ms)
-    await page.get_by_text("Authentication app").first.click()
-    await page.wait_for_timeout(step_wait_ms)
-    await page.get_by_text("Get started").first.click()
-    await page.wait_for_timeout(step_wait_ms * 2)
+async def _decode_when_rendered(page, attempts: int, interval_ms: int) -> Optional[str]:
+    """QR は非同期に描画されるため、読めるまで数回スクリーンショットを撮り直す。"""
+    for _ in range(attempts):
+        secret = decode_qr_secret(await page.screenshot())
+        if secret:
+            return secret
+        await page.wait_for_timeout(interval_ms)
+    return None
 
-    secret = decode_qr_secret(await page.screenshot())
-    if not secret:
-        logger.warning("2FA: QRコードから secret を取得できず")
+
+async def enable_totp_2fa(
+    page,
+    *,
+    step_wait_ms: int = 1000,
+    click_timeout_ms: int = 15000,
+    qr_attempts: int = 10,
+    confirm_timeout_ms: int = 10000,
+) -> Optional[str]:
+    """ログイン済みの page で 2FA を有効化する。成功時のみ平文の secret を返す。
+
+    どの段階で失敗しても例外は握りつぶさず None を返す（呼び出し側は 2FA なしで納品する）。
+    """
+    async def click(text: str):
+        await page.get_by_text(text).first.click(timeout=click_timeout_ms)
+
+    try:
+        await page.goto(LOGIN_VERIFICATION_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(step_wait_ms)
+        await click("Authentication app")
+        await page.wait_for_timeout(step_wait_ms)
+        await click("Get started")
+
+        secret = await _decode_when_rendered(page, qr_attempts, step_wait_ms)
+        if not secret:
+            logger.warning("2FA: QRコードから secret を取得できず")
+            return None
+
+        await click("Next")
+
+        code_input = page.locator("input[type=text]").first
+        await code_input.wait_for(state="visible", timeout=click_timeout_ms)
+        await code_input.fill(pyotp.TOTP(secret).now())
+        await page.wait_for_timeout(step_wait_ms)
+        await click("Confirm")
+
+        # 受理されれば入力欄は消える。拒否されると残る（残れば有効化できていない扱い）。
+        try:
+            await code_input.wait_for(state="hidden", timeout=confirm_timeout_ms)
+        except Exception:
+            logger.warning("2FA: 確認コードが受理されなかった（入力欄が残っている）")
+            return None
+        return secret
+    except Exception as e:
+        logger.warning(f"2FA: 有効化に失敗: {type(e).__name__}: {e}")
         return None
-
-    await page.get_by_text("Next").first.click()
-    await page.wait_for_timeout(step_wait_ms)
-
-    code_input = page.locator("input[type=text]").first
-    await code_input.fill(pyotp.TOTP(secret).now())
-    await page.wait_for_timeout(step_wait_ms)
-    await page.get_by_text("Confirm").first.click()
-    await page.wait_for_timeout(confirm_wait_ms)
-
-    # コードが拒否されると入力欄が残る。残っていれば有効化できていない扱いにする。
-    if await code_input.count() and await code_input.is_visible():
-        logger.warning("2FA: 確認コードが受理されなかった（入力欄が残っている）")
-        return None
-    return secret

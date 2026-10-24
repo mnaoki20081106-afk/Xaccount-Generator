@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -17,6 +17,13 @@ class ProxyConfig(BaseModel):
     session_lifetime_minutes: int = 10080
     killswitch: bool = True          # IP を失ったら黙って別 IP に変わらず 410 を返す（IPRoyal）
     max_accounts_per_ip: int = 5
+
+    @model_validator(mode="after")
+    def _clamp_provider_limits(self):
+        # StatesideIP のスティッキーは最大30分。期限の計算（計画的なIP変更の判定）も合わせる。
+        if self.provider.lower() == "statesideip" and self.session_lifetime_minutes > 30:
+            self.session_lifetime_minutes = 30
+        return self
 
 
 class BrowserConfig(BaseModel):
@@ -47,6 +54,7 @@ class FactoryConfig(BaseModel):
     max_per_hour: int = 6
     use_phone: bool = True
     setup_profile: bool = True           # サインアップ後にプロフィール完成
+    enroll_2fa: bool = True              # サインアップ後にX側で2FA(認証アプリ)を有効化し、鍵を保存
 
 
 class EmailConfig(BaseModel):
