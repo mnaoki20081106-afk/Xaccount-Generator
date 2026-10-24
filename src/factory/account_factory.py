@@ -132,6 +132,32 @@ class AccountFactory:
         from ..utils.crypto import encrypt_secret
         return encrypt_secret(pw, self.config.twofa.encryption_key)
 
+    async def _enroll_2fa(self, username: str, auth_token, ct0, proxy_url: str) -> str | None:
+        """X 側で 2FA を有効化し、暗号化した秘密鍵を返す。失敗時は None（未登録の鍵は渡さない）。"""
+        if not self.config.twofa.enabled or not auth_token or not ct0:
+            return None
+        from ..auth.twofa_enroll import enable_totp_2fa
+        context = None
+        try:
+            # twittergen と同じ英語UI文言でクリックするため locale は en-US
+            context = await self.browser.new_context(proxy_url=proxy_url, locale="en-US")
+            await context.add_cookies([
+                {"name": "auth_token", "value": auth_token, "domain": ".x.com", "path": "/", "secure": True, "httpOnly": True},
+                {"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/", "secure": True},
+            ])
+            page = await self.browser.new_page(context, block_resources=False)
+            secret = await enable_totp_2fa(page)
+            if not secret:
+                return None
+            logger.success(f"[{username}] 2FA enabled")
+            return self.twofa_manager.encrypt(secret)
+        except Exception as e:
+            logger.warning(f"[{username}] 2FA enrollment failed: {e}")
+            return None
+        finally:
+            if context is not None:
+                await context.close()
+
     async def _create_via_api_flow(
         self,
         email: str,
@@ -158,9 +184,10 @@ class AccountFactory:
         if not ok or not flow.auth_token:
             return None
 
-        # 2FA: X 側への登録(有効化)フローが未実装のため、ランダムな秘密鍵を作って
-        # 「2FAあり」と見せかけて納品しない（客が使えないキーを渡す品質事故になる）。
-        twofa_secret = None
+        # 2FA: X 側で実際に有効化できた鍵だけを保存する（未登録の鍵は渡さない）。
+        twofa_secret = await self._enroll_2fa(
+            flow.username or email, flow.auth_token, flow.ct0, proxy.url
+        )
 
         account = Account(
             username=flow.username or f"api_{int(time.time())}",
@@ -275,7 +302,7 @@ class AccountFactory:
                 await setup_profile(profile_page, username, display_name)
                 await profile_page.close()
 
-            twofa_secret = None  # 上記 API フロー側のコメント参照（未登録の鍵は渡さない）
+            twofa_secret = await self._enroll_2fa(username, auth_token, ct0, proxy.url)
 
             account = Account(
                 username=username,
