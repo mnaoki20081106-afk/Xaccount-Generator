@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import sys
+import json
 import time
 from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -252,6 +253,10 @@ async def pop_accounts(request: Request, body_model: PopRequest):
             ) <= cutoff
         ]
 
+    if _state.config.warmup.require_graduation:
+        graduated = await _state.db.graduated_account_ids()
+        candidates = [a for a in candidates if a.id in graduated]
+
     selected = candidates[: body_model.count]
     if not selected:
         raise HTTPException(409, detail="OUT_OF_STOCK")
@@ -274,6 +279,38 @@ async def pop_accounts(request: Request, body_model: PopRequest):
         })
 
     return {"ok": True, "popped": len(results), "accounts": results}
+
+
+@app.get("/api/generator/graduation")
+async def graduation_overview(request: Request):
+    body = await request.body()
+    await _verify_request(request, body)
+
+    accounts = await _state.db.list_accounts(limit=100000)
+    out = []
+    for a in accounts:
+        g = await _state.db.get_graduation(a.id)
+        if not g:
+            continue
+        try:
+            report = json.loads(g["report"]) if g.get("report") else None
+        except ValueError:
+            report = None
+        out.append({
+            "id": a.id, "username": a.username, "passed": bool(g["passed"]),
+            "attempts": g["attempts"], "checked_at": g["checked_at"], "report": report,
+        })
+    return {"graduated": sum(1 for o in out if o["passed"]), "accounts": out}
+
+
+@app.get("/api/generator/proxy/ip/{session_id}")
+async def proxy_ip_history(request: Request, session_id: str):
+    body = await request.body()
+    await _verify_request(request, body)
+    rep = _state.proxy_manager.ip_report(session_id)
+    if rep is None:
+        raise HTTPException(404, detail="SESSION_NOT_FOUND")
+    return rep
 
 
 class GenerateRequest(BaseModel):

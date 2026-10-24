@@ -8,7 +8,9 @@ proxy:
   username: "YOUR_PROXY_USER"
   password: "YOUR_PROXY_PASS"
   country: ""                  # "" = 混合IP（最安）。"jp" で日本IP固定
-  sticky_ttl_minutes: 30
+  sticky_ttl_minutes: 30       # 互換用（未使用）
+  session_lifetime_minutes: 10080  # スティッキー維持時間。IPRoyal最大7日。サインアップ→ウォームアップで同一IPを保つ
+  killswitch: true             # IPを失った時に黙って別IPへ変わらず410を返す（IPRoyal）
   max_accounts_per_ip: 3       # 同一IPに割り当てる最大垢数（少なめ推奨）
 
 browser:
@@ -81,3 +83,10 @@ logging:
 warmup:
   min_days_before_sale: 21    # HStoraレベル: 21日以上
   actions_per_day_soft: 8
+  # 卒業テスト（python -m src.main graduate / run デーモン内で自動）
+  require_graduation: true            # /pop は卒業テスト合格済みの垢だけ払い出す
+  graduation_min_days: 21
+  graduation_min_active_days: 10
+  graduation_min_tweets: 8
+  graduation_max_unplanned_ip_changes: 0
+  graduation_max_attempts: 5

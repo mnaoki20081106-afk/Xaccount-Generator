@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS vps_contract (
     updated_at TEXT NOT NULL
 );
 
+-- 卒業テスト（ウォームアップ完了→検索TOP掲載の確認）の状態と結果
+CREATE TABLE IF NOT EXISTS graduation (
+    account_id INTEGER PRIMARY KEY,
+    passed INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    canary_token TEXT,
+    canary_tweet_id TEXT,
+    canary_posted_at TEXT,
+    report TEXT,
+    checked_at TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
 CREATE TABLE IF NOT EXISTS action_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL,
@@ -229,6 +242,57 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ── 卒業テスト ──
+
+    async def get_graduation(self, account_id: int) -> Optional[dict]:
+        row = await (await self.conn.execute(
+            "SELECT * FROM graduation WHERE account_id = ?", (account_id,)
+        )).fetchone()
+        return dict(row) if row else None
+
+    async def save_graduation(self, account_id: int, **fields) -> None:
+        allowed = {"passed", "attempts", "canary_token", "canary_tweet_id",
+                   "canary_posted_at", "report", "checked_at"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"unknown graduation fields: {bad}")
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO graduation (account_id) VALUES (?)", (account_id,)
+        )
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            await self.conn.execute(
+                f"UPDATE graduation SET {sets} WHERE account_id = ?",
+                (*fields.values(), account_id),
+            )
+        await self.conn.commit()
+
+    async def graduated_account_ids(self) -> set[int]:
+        rows = await (await self.conn.execute(
+            "SELECT account_id FROM graduation WHERE passed = 1"
+        )).fetchall()
+        return {r["account_id"] for r in rows}
+
+    async def action_stats(self, account_id: int) -> dict:
+        """行動ログの集計: 種別ごとの件数と、何かしら行動した日数。"""
+        rows = await (await self.conn.execute(
+            "SELECT action, COUNT(*) AS n FROM action_log WHERE account_id = ? GROUP BY action",
+            (account_id,),
+        )).fetchall()
+        days = await (await self.conn.execute(
+            "SELECT COUNT(DISTINCT substr(created_at, 1, 10)) AS d FROM action_log "
+            "WHERE account_id = ? AND action IN ('likes','follows','tweets','browse')",
+            (account_id,),
+        )).fetchone()
+        return {"counts": {r["action"]: r["n"] for r in rows}, "active_days": days["d"] if days else 0}
+
+    async def last_action_detail(self, account_id: int, action: str) -> Optional[str]:
+        row = await (await self.conn.execute(
+            "SELECT detail FROM action_log WHERE account_id = ? AND action = ? ORDER BY id DESC LIMIT 1",
+            (account_id, action),
+        )).fetchone()
+        return row["detail"] if row else None
 
     # ── コスト（支払い台帳・VPS契約） ──
 

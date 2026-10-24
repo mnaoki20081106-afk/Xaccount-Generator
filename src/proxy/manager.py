@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from loguru import logger
@@ -103,15 +105,79 @@ class ProxySession:
         self._d["circuit_open_until"] = None
         self._d["last_exit_ip"] = exit_ip
 
+    def mark_ip_lost(self):
+        """killswitch(410) 等でスティッキー IP を失った。次に観測する別 IP は想定外の変化として数える。"""
+        self._d["ip_lost"] = True
+
     # ──────────────────────────────────────────
+
+    # ── 出口 IP の履歴（サインアップ→ウォームアップの IP 一致を追跡する） ──
+    @property
+    def ip_history(self) -> list[dict]:
+        return self._d.setdefault("ip_history", [])
+
+    @property
+    def signup_ip(self) -> Optional[str]:
+        h = self.ip_history
+        return h[0]["ip"] if h else None
+
+    @property
+    def current_ip(self) -> Optional[str]:
+        h = self.ip_history
+        return h[-1]["ip"] if h else None
+
+    @property
+    def unplanned_ip_changes(self) -> int:
+        return self._d.get("unplanned_ip_changes", 0)
+
+    @property
+    def expected_expiry(self) -> Optional[datetime]:
+        """スティッキー lifetime の満了予定。これ以降の IP 変化は想定内（planned）扱い。"""
+        st = _parse_dt(self._d.get("sticky_started_at"))
+        return st + timedelta(minutes=self._config.session_lifetime_minutes) if st else None
+
+    def observe_ip(self, ip: str) -> str:
+        """出口 IP を観測して履歴に反映。戻り値: baseline / same / planned_change / unplanned_change。"""
+        now = datetime.now(timezone.utc)
+        hist = self.ip_history
+        if not hist:
+            hist.append({"ip": ip, "at": now.isoformat(), "planned": False})
+            self._d.setdefault("sticky_started_at", now.isoformat())
+            return "baseline"
+        if hist[-1]["ip"] == ip:
+            return "same"
+        exp = self.expected_expiry
+        planned = bool(exp and now >= exp - timedelta(minutes=5))
+        self._d.pop("ip_lost", None)
+        hist.append({"ip": ip, "at": now.isoformat(), "planned": planned})
+        del hist[:-20]
+        if planned:
+            self._d["sticky_started_at"] = now.isoformat()
+            return "planned_change"
+        self._d["unplanned_ip_changes"] = self.unplanned_ip_changes + 1
+        return "unplanned_change"
 
     @property
     def url(self) -> str:
         c = self._config
-        user = f"{c.username}-session-{self.session_id}"
-        if c.country:
-            user += f"-country-{c.country}"
-        return f"http://{user}:{c.password}@{c.host}:{c.port}"
+        sid = self.session_id
+        if c.provider.lower() == "iproyal":
+            # IPRoyal は username ではなく password の末尾に `_key-value` を足す方式。
+            # session は英数字ちょうど8文字、lifetime は 1s〜7d。killswitch で
+            # IP を失った時に黙って別 IP へ切り替わらず HTTP 410 を返させる。
+            pw = c.password
+            if c.country:
+                pw += f"_country-{c.country}"
+            pw += f"_session-{sid}_lifetime-{c.session_lifetime_minutes}m"
+            if c.killswitch:
+                pw += "_killswitch-1"
+            user = c.username
+        else:
+            user = f"{c.username}-session-{sid}"
+            if c.country:
+                user += f"-country-{c.country}"
+            pw = c.password
+        return f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{c.host}:{c.port}"
 
     def is_cooling(self) -> bool:
         cu = self.cooldown_until
@@ -188,7 +254,8 @@ class ProxyManager:
 
     def _save_state(self):
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(
                 {
                     "sessions": self._sessions,
@@ -199,6 +266,7 @@ class ProxyManager:
                 ensure_ascii=False,
             )
         )
+        os.replace(tmp, STATE_FILE)  # 別プロセスが半端な JSON を読まないよう原子的に置換
         try:
             self._state_mtime = STATE_FILE.stat().st_mtime_ns
         except OSError:
@@ -247,6 +315,8 @@ class ProxyManager:
             "consecutive_failures": 0,
             "circuit_open_until": None,
             "last_exit_ip": "",
+            "ip_history": [],
+            "unplanned_ip_changes": 0,
         }
         self._sessions[sid] = new_d
         sess = ProxySession(new_d, self.config)
@@ -281,9 +351,55 @@ class ProxyManager:
                 "consecutive_failures": 0,
                 "circuit_open_until": None,
                 "last_exit_ip": "",
+                "ip_history": [],
+                "unplanned_ip_changes": 0,
             }
         self._save_state()
         return ProxySession(self._sessions[wu_sid], self.config)
+
+    def proxy_for_account(self, account) -> ProxySession:
+        """垢が生成された時のセッション（DB の proxy_id）を最優先で返す。
+        username をキーにした対応表は、サインアップ中に username が衝突リトライで
+        変わると外れて、ウォームアップが別 IP になる。proxy_id なら確実に同じ IP。"""
+        self.refresh()
+        sid = getattr(account, "proxy_id", None)
+        if sid and sid in self._sessions:
+            self._account_map[account.username] = sid
+            self._save_state()
+            return ProxySession(self._sessions[sid], self.config)
+        return self.get_warmup_proxy(account.username)
+
+    async def verify_account_ip(self, account) -> dict:
+        """ウォームアップ前に、垢のセッションが生成時と同じ出口 IP かを実測する。
+        戻り値 ok=False のとき呼び出し側はその垢のアクションを見送ること。
+        kind: baseline / same / planned_change / unplanned_change / unreachable"""
+        sess = self.proxy_for_account(account)
+        info = {"session_id": sess.session_id, "signup_ip": sess.signup_ip}
+        if sess.is_circuit_open():
+            return {**info, "ok": False, "kind": "unreachable", "ip": None}
+        if not await self.health_check(sess):
+            return {**info, "ok": False, "kind": "unreachable", "ip": None}
+        sess = self._session_obj(sess.session_id)
+        kind = sess._d.get("last_ip_kind", "same")
+        return {
+            **info, "ok": kind != "unplanned_change", "kind": kind, "ip": sess.current_ip,
+            "unplanned_changes": sess.unplanned_ip_changes,
+        }
+
+    def ip_report(self, session_id: str) -> Optional[dict]:
+        self.refresh()
+        d = self._sessions.get(session_id)
+        if d is None:
+            return None
+        s = ProxySession(d, self.config)
+        return {
+            "session_id": session_id,
+            "signup_ip": s.signup_ip,
+            "current_ip": s.current_ip,
+            "unplanned_changes": s.unplanned_ip_changes,
+            "planned_changes": sum(1 for h in s.ip_history if h.get("planned")),
+            "history": list(s.ip_history),
+        }
 
     # ──────────────────────────────────────────
     # ヘルスチェック（サーキットブレーカー連携）
@@ -300,6 +416,8 @@ class ProxyManager:
                     proxy=session.url, timeout=12.0, follow_redirects=True
                 ) as client:
                     r = await client.get(check_url)
+                    if r.status_code == 410:
+                        session.mark_ip_lost()
                     if r.status_code == 200:
                         try:
                             data = r.json()
@@ -307,12 +425,22 @@ class ProxyManager:
                         except Exception:
                             ip = r.text.strip()[:20]
                         session.record_health_success(ip)
+                        if ip and ip != "?":
+                            kind = session.observe_ip(ip)
+                            session._d["last_ip_kind"] = kind
+                            if kind == "unplanned_change":
+                                logger.warning(
+                                    f"Proxy session={session.session_id} 出口IPが想定外に変化 "
+                                    f"→ {ip} (履歴 {len(session.ip_history)})"
+                                )
                         self._save_state()
                         logger.debug(
                             f"Proxy OK exit_ip={ip} session={session.session_id}"
                         )
                         return True
             except Exception as e:
+                if "410" in str(e):
+                    session.mark_ip_lost()
                 logger.debug(f"Health check {check_url} failed: {e}")
                 continue
 

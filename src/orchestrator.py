@@ -5,7 +5,7 @@
 import asyncio
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from loguru import logger
 
@@ -21,8 +21,11 @@ from .actions.login import LoginAction
 from .actions.tweet import TweetAction
 from .actions.follow import FollowAction
 from .actions.like import LikeAction
-from .warmup import WarmupScheduler
+from .warmup import WarmupScheduler, is_active_hour
 from .detector import ShadowbanDetector, ShadowbanResolver
+from .graduation import GraduationExaminer
+
+_ALL = 100000  # list_accounts の既定 limit=100 だと101垢目以降が処理されないため
 
 
 class _RateLimiter:
@@ -74,7 +77,7 @@ class Orchestrator:
             self.twofa_manager,
             self.browser,
         )
-        self.detector = ShadowbanDetector(self.browser)
+        self.detector = ShadowbanDetector(self.browser, client_factory=self._api_client)
         self.resolver = ShadowbanResolver(
             self.browser, self.login_action, self.tweet_action, self.like_action
         )
@@ -87,6 +90,12 @@ class Orchestrator:
             self.like_action,
             db=self.db,
         )
+        self.graduation = GraduationExaminer(self.db, self.proxy_manager, config.warmup)
+
+    @staticmethod
+    def _api_client(account: Account, proxy_url: str | None):
+        from .actions.x_api import XApiClient
+        return XApiClient(account.auth_token, account.ct0, proxy_url=proxy_url)
 
     async def start(self):
         await self.db.connect()
@@ -144,7 +153,7 @@ class Orchestrator:
         """
         全アクティブ垢の1日分ウォームアップを並列実行。
         """
-        accounts = await self.db.list_accounts()
+        accounts = await self.db.list_accounts(limit=_ALL)
         active = [
             a for a in accounts
             if a.status in (AccountStatus.CREATED, AccountStatus.WARMING, AccountStatus.CLEAN)
@@ -155,7 +164,16 @@ class Orchestrator:
 
         async def _warmup_one(account: Account):
             async with sem:
-                proxy = self.proxy_manager.get_warmup_proxy(account.username)
+                if not is_active_hour():
+                    return  # 夜間は動かさない（IP確認の通信も無駄なので先に弾く）
+                # 生成時と同じセッション(proxy_id)で、実際に同じ出口IPか確認してから動かす。
+                # 想定外にIPが変わっていたら記録し、その日の行動は見送る（卒業判定にも反映される）。
+                ipc = await self.proxy_manager.verify_account_ip(account)
+                if not ipc["ok"]:
+                    logger.warning(f"[@{account.username}] IP check {ipc['kind']} — warmup skipped ({ipc})")
+                    await self.db.log_action(account.id, "ip_check", f"{ipc['kind']}:{ipc.get('ip')}")
+                    return
+                proxy = self.proxy_manager.proxy_for_account(account)
                 result = await self.warmup.run_daily_actions(account, proxy_url=proxy.url)
                 if "error" not in result:
                     await self.db.update_last_action(account.id)
@@ -175,27 +193,72 @@ class Orchestrator:
         """
         全垢を検査し、バン状態を更新。解除アクションも自動実行。
         """
-        accounts = await self.db.list_accounts()
+        # SOLD/凍結/ロックは対象外。以前は全垢を検査して status を上書きしていたため、
+        # 売却済み(SOLD)がCLEANに戻って再販売され、作成直後の垢も即CLEAN(販売可)になっていた。
+        skip = {AccountStatus.SOLD, AccountStatus.SUSPENDED, AccountStatus.LOCKED}
+        accounts = [a for a in await self.db.list_accounts(limit=_ALL) if a.status not in skip]
         sem = asyncio.Semaphore(concurrency)
 
         async def _check_one(account: Account):
             async with sem:
-                ban_status = await self.detector.check(account.username)
+                observer = await self.graduation.pick_observer(account)
+                obs_proxy = self.proxy_manager.proxy_for_account(observer).url if observer else None
+                stats = await self.db.action_stats(account.id)
+                ban_status = await self.detector.check(
+                    account.username, observer=observer, observer_proxy_url=obs_proxy,
+                    has_tweets=stats["counts"].get("tweets", 0) > 0,
+                )
+                if ban_status.unknown:
+                    return  # 判定できなかった垢は状態を動かさない
                 await self.db.update_shadow_score(account.id, ban_status.shadow_score)
                 new_status = ban_status.status
+                # ウォームアップ中の垢は、検査で「問題なし」でもCLEAN(販売可)に昇格させない。
+                # CLEANへの昇格は経過日数を満たしてから。
+                if new_status == AccountStatus.CLEAN and account.status in (
+                    AccountStatus.CREATED, AccountStatus.WARMING
+                ):
+                    age = (datetime.now(timezone.utc) - (
+                        account.created_at if account.created_at.tzinfo
+                        else account.created_at.replace(tzinfo=timezone.utc))).days
+                    if age < self.config.warmup.min_days_before_sale:
+                        new_status = account.status
 
                 if new_status != account.status:
                     await self.db.update_status(account.id, new_status)
                     logger.info(f"[@{account.username}] status {account.status} → {new_status}")
 
                 if not ban_status.is_clean:
-                    proxy = self.proxy_manager.get_proxy_for_account(account.username)
+                    proxy = self.proxy_manager.proxy_for_account(account)
                     await self.resolver.resolve(account, ban_status, proxy_url=proxy.url)
 
                 await asyncio.sleep(random.uniform(2.0, 5.0))
 
         tasks = [_check_one(a) for a in accounts]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ──────────────────────────────────────────
+    # 卒業テスト
+    # ──────────────────────────────────────────
+
+    async def run_graduation_cycle(self, concurrency: int = 2) -> dict:
+        """CLEAN（検査で問題なし）かつ経過日数を満たした垢に卒業テストを回す。"""
+        accounts = await self.db.list_accounts(status=AccountStatus.CLEAN, limit=_ALL)
+        sem = asyncio.Semaphore(concurrency)
+        tally: dict[str, int] = {}
+
+        async def _one(account: Account):
+            async with sem:
+                try:
+                    report = await self.graduation.examine(account)
+                except Exception as e:
+                    logger.exception(f"[@{account.username}] graduation error: {e}")
+                    return
+                tally[report.stage] = tally.get(report.stage, 0) + 1
+                await asyncio.sleep(random.uniform(5, 20))
+
+        await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
+        logger.info(f"Graduation cycle: {tally}")
+        return tally
 
     # ──────────────────────────────────────────
     # フル自動ループ（デーモン用）
@@ -228,7 +291,10 @@ class Orchestrator:
                 # 3. シャドウバン確認（6時間に1回）
                 await self.run_shadowban_check()
 
-                # 4. 待機
+                # 4. 卒業テスト（canary は投稿→次サイクルで検索、の2段階）
+                await self.run_graduation_cycle()
+
+                # 5. 待機
                 wait = check_interval_hours * 3600
                 jitter = random.uniform(-300, 300)
                 logger.info(f"Cycle done, sleeping {(wait + jitter) / 3600:.1f}h")

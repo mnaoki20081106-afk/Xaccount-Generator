@@ -12,6 +12,7 @@ x-client-transaction-id ヘッダーを自動生成（x.com から鍵を取得�
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 from contextlib import nullcontext
@@ -428,3 +429,176 @@ class XApiClient:
             return False
         except Exception:
             return False
+
+    # ────────────────────────────────────────────
+    # 出口 IP（プロキシとの一致確認用）
+    # ────────────────────────────────────────────
+
+    async def exit_ip(self) -> Optional[str]:
+        """この接続が実際に使っている出口 IP を返す（取得できなければ None）。
+        プロキシ経由の AsyncSession と同じ経路を使うので、X に見えている IP と一致する。"""
+        s = self._open_session
+        for url in ("https://api.ipify.org?format=json", "https://api.my-ip.io/ip.json"):
+            try:
+                async with (nullcontext(s) if s else self._session()) as _s:
+                    r = await (s or _s).get(url)
+                if r.status_code == 410:
+                    raise XProxyIpLost("proxy killswitch (HTTP 410): sticky IP lost", 410)
+                if r.status_code == 200:
+                    return r.json().get("ip")
+            except XProxyIpLost:
+                raise
+            except Exception as e:
+                logger.debug(f"[XApi] exit_ip {url} failed: {e}")
+        return None
+
+    # ────────────────────────────────────────────
+    # 検索（卒業テスト / シャドウバン判定用）
+    # ────────────────────────────────────────────
+
+    async def _search_query_id(self) -> str:
+        """SearchTimeline の queryId。x.com の main.js から取得（キャッシュ）。失敗時は既知の値。"""
+        global _search_query_id_cache
+        if _search_query_id_cache:
+            return _search_query_id_cache
+        try:
+            s = self._open_session
+            async with (nullcontext(s) if s else self._session()) as _s:
+                s = s or _s
+                home = await s.get("https://x.com", headers={"User-Agent": _USER_AGENT})
+                m = re.search(r'https://abs\.twimg\.com/responsive-web/client-web[^"\']*?/main\.[0-9a-z]+\.js', home.text)
+                if m:
+                    js = (await s.get(m.group(0), headers={"User-Agent": _USER_AGENT})).text
+                    q = re.search(r'queryId:"([\w-]+)",operationName:"SearchTimeline"', js)
+                    if q:
+                        _search_query_id_cache = q.group(1)
+                        return _search_query_id_cache
+        except Exception as e:
+            logger.debug(f"[XApi] SearchTimeline queryId lookup failed: {e}")
+        return _SEARCH_QUERY_ID_FALLBACK
+
+    async def search_timeline(self, query: str, product: str = "Top", count: int = 20) -> list[dict]:
+        """
+        GraphQL SearchTimeline（twikit / twscrape と同じ呼び方）。
+        product: Top / Latest / People / Media。
+        戻り値: product が People なら {"screen_name", "name"}、それ以外は
+        {"id", "text", "screen_name"} のリスト（表示順＝検索順位）。
+        """
+        qid = await self._search_query_id()
+        variables = {"rawQuery": query, "count": count, "querySource": "typed_query", "product": product}
+        features = dict(_SEARCH_FEATURES)
+        for _ in range(3):  # 「features が足りない」エラーには不足分を False で足して再試行
+            body = await self._get(
+                f"{_BASE}/graphql/{qid}/SearchTimeline",
+                params={"variables": json.dumps(variables, separators=(",", ":")),
+                        "features": json.dumps(features, separators=(",", ":"))},
+            )
+            missing = _missing_features(body)
+            if not missing:
+                return parse_search_results(body, people=(product == "People"))
+            features.update({k: False for k in missing})
+        return []
+
+    async def post_tweet(self, text: str) -> Optional[str]:
+        """ツイートして tweet id を返す（失敗は None）。tweet() は bool 互換のまま残す。"""
+        try:
+            body = await self._post(
+                f"{_BASE}/1.1/statuses/update.json",
+                data={"status": text, "tweet_mode": "extended"},
+            )
+            return str(body.get("id_str") or body.get("id") or "") or None
+        except (XDuplicateTweet, XAccountSuspended, XRateLimited) as e:
+            logger.warning(f"[XApi] post_tweet: {type(e).__name__}")
+        except Exception as e:
+            logger.debug(f"[XApi] post_tweet error: {e}")
+        return None
+
+
+class XProxyIpLost(XApiError):
+    """IPRoyal の killswitch（HTTP 410）: スティッキー IP が失われた。"""
+
+
+_SEARCH_QUERY_ID_FALLBACK = "flaR-PUMshxFWZWPNpq4zA"  # twikit の値（古くなり得る→main.js から取得）
+_search_query_id_cache: Optional[str] = None
+_SEARCH_FEATURES = {
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+
+
+def _missing_features(body) -> list[str]:
+    """`The following features cannot be null: a, b` 形式のエラーから不足 feature 名を抜く。"""
+    out: list[str] = []
+    for err in (body or {}).get("errors", []) if isinstance(body, dict) else []:
+        m = re.search(r"features cannot be null: ([\w, ]+)", err.get("message", ""))
+        if m:
+            out += [x.strip() for x in m.group(1).split(",") if x.strip()]
+    return out
+
+
+def _walk(node, key: str):
+    """ネストした dict/list から key を持つ値を全て順に返す。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key:
+                yield v
+            yield from _walk(v, key)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk(v, key)
+
+
+def parse_search_results(body: dict, people: bool = False) -> list[dict]:
+    """SearchTimeline の応答を、画面に出る順の簡易リストにする。"""
+    instructions = next(iter(_walk(body, "instructions")), None) or []
+    entries: list = []
+    for ins in instructions:
+        if isinstance(ins, dict) and isinstance(ins.get("entries"), list):
+            entries += ins["entries"]
+    out: list[dict] = []
+    for e in entries:
+        eid = e.get("entryId", "")
+        if people:
+            if not eid.startswith("user-"):
+                continue
+            res = next(iter(_walk(e, "result")), None) or {}
+            core = res.get("core", {}).get("user_results", {}).get("result", res)
+            legacy = res.get("legacy", {}) or core.get("legacy", {})
+            sn = (res.get("core", {}) or {}).get("screen_name") or legacy.get("screen_name")
+            name = (res.get("core", {}) or {}).get("name") or legacy.get("name")
+            if sn:
+                out.append({"screen_name": sn, "name": name or ""})
+        else:
+            if not eid.startswith("tweet-"):
+                continue
+            res = next(iter(_walk(e, "tweet_results")), {}).get("result", {}) or {}
+            res = res.get("tweet", res)  # TweetWithVisibilityResults
+            legacy = res.get("legacy", {})
+            if not legacy:
+                continue
+            user = res.get("core", {}).get("user_results", {}).get("result", {})
+            sn = user.get("core", {}).get("screen_name") or user.get("legacy", {}).get("screen_name", "")
+            out.append({"id": str(res.get("rest_id") or legacy.get("id_str", "")),
+                        "text": legacy.get("full_text", ""), "screen_name": sn})
+    return out

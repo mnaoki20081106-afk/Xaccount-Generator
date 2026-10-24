@@ -57,6 +57,15 @@ async def cmd_check(config):
         await orc.stop()
 
 
+async def cmd_graduate(config, concurrency: int):
+    orc = Orchestrator(config)
+    await orc.start()
+    try:
+        await orc.run_graduation_cycle(concurrency=concurrency)
+    finally:
+        await orc.stop()
+
+
 async def cmd_run(config, target: int, gen_concurrency: int, warmup_concurrency: int, interval_hours: float):
     orc = Orchestrator(config)
     await orc.start()
@@ -91,6 +100,9 @@ async def cmd_worker(config, worker_type: str, concurrency: int, target: int):
         elif worker_type == "warmup":
             logger.info(f"Worker: warmup (concurrency={concurrency})")
             await orc.run_warmup_cycle(concurrency=concurrency)
+        elif worker_type == "graduate":
+            logger.info("Worker: graduation test")
+            await orc.run_graduation_cycle(concurrency=concurrency)
         elif worker_type == "check":
             logger.info("Worker: shadowban check")
             await orc.run_shadowban_check()
@@ -139,6 +151,9 @@ def main():
 
     sub.add_parser("check", help="シャドウバン確認")
 
+    p_grad = sub.add_parser("graduate", help="卒業テスト（検索TOP掲載の実測）を1回実行")
+    p_grad.add_argument("--concurrency", type=int, default=2)
+
     p_run = sub.add_parser("run", help="フルデーモン起動")
     p_run.add_argument("--target", type=int, default=100, help="維持する垢数")
     p_run.add_argument("--gen-concurrency", type=int, default=2)
@@ -147,7 +162,7 @@ def main():
 
     p_worker = sub.add_parser("worker", help="プロセス分離ワーカー（2GB VPS向け）")
     p_worker.add_argument(
-        "--type", choices=["generate", "warmup", "check"], required=True,
+        "--type", choices=["generate", "warmup", "check", "graduate"], required=True,
         help="ワーカー種別: generate / warmup / check"
     )
     p_worker.add_argument("--concurrency", type=int, default=1, help="同時実行数（VPSは1推奨）")
@@ -173,6 +188,8 @@ def main():
         asyncio.run(cmd_generate(config, args.count, args.concurrency))
     elif args.command == "warmup":
         asyncio.run(cmd_warmup(config, args.concurrency))
+    elif args.command == "graduate":
+        asyncio.run(cmd_graduate(config, args.concurrency))
     elif args.command == "check":
         asyncio.run(cmd_check(config))
     elif args.command == "run":

@@ -7,9 +7,9 @@
 - full_ban:    完全にゴースト状態
 
 検知フロー:
-  1. hisubscriptions API（メイン）
-  2. API失敗 → shadowban.eu 互換 API（バックアップ）
-  3. ゲスト検索 API で from:@username を実際に叩く（最終確認）
+  1. 別垢（観測者）から People / from: 検索を実際に叩く（主）
+  2. 外部のシャドウバン確認サイト（補助）
+  3. どちらも得られなければ unknown（クリーン扱いしない）
 """
 from __future__ import annotations
 
@@ -28,24 +28,7 @@ from ..actions.login import LoginAction
 from ..actions.tweet import TweetAction
 from ..actions.like import LikeAction
 
-# X ゲスト認証 — 公開 Bearer トークン（変わることがある）
-_GUEST_BEARER = (
-    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
-    "=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-)
-_GUEST_TOKEN_URL = "https://api.twitter.com/1.1/guest/activate.json"
-_SEARCH_URL = (
-    "https://twitter.com/i/api/2/search/adaptive.json"
-    "?q=from%3A{handle}&count=5&result_filter=live"
-)
-
-# Shadowban チェック API — 複数エンドポイントでフォールバック
-_SB_APIS = [
-    "https://hisubscriptions.com/api/shadowban",
-    "https://shadowban.eu/.api/{handle}",
-]
-
-
+@dataclass
 @dataclass
 class BanStatus:
     search_ban: bool = False
@@ -53,6 +36,8 @@ class BanStatus:
     full_ban: bool = False
     checked_at: Optional[datetime] = None
     source: str = "unknown"
+    # 判定材料が1つも得られなかった。この時は「クリーン」と見なしてはいけない。
+    unknown: bool = False
 
     def __post_init__(self):
         if self.checked_at is None:
@@ -71,7 +56,7 @@ class BanStatus:
 
     @property
     def is_clean(self) -> bool:
-        return not (self.search_ban or self.reply_ban or self.full_ban)
+        return not self.unknown and not (self.search_ban or self.reply_ban or self.full_ban)
 
     @property
     def status(self) -> AccountStatus:
@@ -83,61 +68,71 @@ class BanStatus:
 
 
 class ShadowbanDetector:
-    def __init__(self, browser: BrowserManager):
-        self.browser = browser
-        self._guest_token_cache: tuple[str, float] | None = None
+    """
+    判定の主役は「別の垢（観測者）から実際に検索する」方式。
+    - ユーザー検索（People）でハンドルが出ない → search_ban
+    - from:ハンドル の最新検索が0件（ツイート済みなのに）→ search_ban
+    外部のシャドウバン確認サイトはレスポンス形式が不安定なので補助扱い。
+    どちらも得られない場合は unknown（=クリーン扱いにしない）。
+    """
 
-    async def check(self, username: str) -> BanStatus:
+    def __init__(self, browser: BrowserManager, client_factory=None):
+        self.browser = browser
+        self._client_factory = client_factory
+
+    async def check(
+        self,
+        username: str,
+        observer=None,
+        observer_proxy_url: Optional[str] = None,
+        has_tweets: bool = True,
+    ) -> BanStatus:
         handle = username.lstrip("@")
 
-        # 1. hisubscriptions.com
-        result = await self._check_hisubscriptions(handle)
-        if result:
-            status = BanStatus(
-                search_ban=result.get("search_ban", False),
-                reply_ban=result.get("reply_ban", False),
-                full_ban=result.get("ghost_ban", False),
-                source="hisubscriptions",
-            )
-            logger.info(
-                f"[@{handle}] shadowban (hisubscriptions): "
-                f"search={status.search_ban} reply={status.reply_ban} full={status.full_ban}"
-            )
-            # search_ban だけゲスト検索で二重確認
-            if status.search_ban or (not result and True):
-                guest_result = await self._verify_search_ban_via_guest_api(handle)
-                if guest_result is not None:
-                    if status.search_ban != guest_result:
-                        logger.info(
-                            f"[@{handle}] search_ban override by guest API: "
-                            f"{status.search_ban} → {guest_result}"
-                        )
-                        status.search_ban = guest_result
-            return status
+        # 1. 観測者の検索（主）
+        if observer is not None and self._client_factory is not None:
+            res = await self._check_via_observer(handle, observer, observer_proxy_url, has_tweets)
+            if res is not None:
+                logger.info(f"[@{handle}] shadowban (observer): search={res.search_ban}")
+                return res
 
-        # 2. shadowban.eu 互換 API フォールバック
-        result2 = await self._check_shadowban_eu(handle)
-        if result2:
-            status = BanStatus(
-                search_ban=result2.get("search_ban", False),
-                reply_ban=result2.get("reply_ban", False),
-                full_ban=result2.get("ghost_ban", False),
-                source="shadowban_eu",
-            )
-            logger.info(
-                f"[@{handle}] shadowban (eu): "
-                f"search={status.search_ban} reply={status.reply_ban} full={status.full_ban}"
-            )
-            return status
+        # 2. 外部サイト（補助）
+        for fn, src in ((self._check_hisubscriptions, "hisubscriptions"),
+                        (self._check_shadowban_eu, "shadowban_eu")):
+            result = await fn(handle)
+            if result:
+                status = BanStatus(
+                    search_ban=result.get("search_ban", False),
+                    reply_ban=result.get("reply_ban", False),
+                    full_ban=result.get("ghost_ban", False),
+                    source=src,
+                )
+                logger.info(
+                    f"[@{handle}] shadowban ({src}): search={status.search_ban} "
+                    f"reply={status.reply_ban} full={status.full_ban}"
+                )
+                return status
 
-        # 3. ゲスト API のみ
-        search_ban = await self._verify_search_ban_via_guest_api(handle)
-        status = BanStatus(
-            search_ban=bool(search_ban),
-            source="guest_api",
-        )
-        logger.info(f"[@{handle}] shadowban (guest_api only): search={status.search_ban}")
-        return status
+        logger.warning(f"[@{handle}] shadowban 判定材料なし → unknown")
+        return BanStatus(source="none", unknown=True)
+
+    async def _check_via_observer(
+        self, handle: str, observer, proxy_url: Optional[str], has_tweets: bool
+    ) -> Optional[BanStatus]:
+        try:
+            async with self._client_factory(observer, proxy_url) as obs:
+                people = await obs.search_timeline(handle, "People")
+                in_people = any(u["screen_name"].lower() == handle.lower() for u in people[:5])
+                if not people:
+                    return None  # 検索自体が空 = 観測者側の不調かもしれない。判定しない
+                search_ban = not in_people
+                if has_tweets and not search_ban:
+                    latest = await obs.search_timeline(f"from:{handle}", "Latest")
+                    search_ban = len(latest) == 0
+                return BanStatus(search_ban=search_ban, source="observer")
+        except Exception as e:
+            logger.debug(f"[@{handle}] observer search error: {e}")
+            return None
 
     # ──────────────────────────────────────────
     # hisubscriptions
@@ -203,78 +198,6 @@ class ShadowbanDetector:
             logger.debug(f"[@{handle}] shadowban.eu error: {e}")
         return None
 
-    # ──────────────────────────────────────────
-    # ゲスト検索 API による from:@username 確認
-    # ──────────────────────────────────────────
-
-    async def _get_guest_token(self) -> Optional[str]:
-        import time
-        if self._guest_token_cache:
-            token, ts = self._guest_token_cache
-            if time.time() - ts < 3600:
-                return token
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(
-                    _GUEST_TOKEN_URL,
-                    headers={
-                        "Authorization": f"Bearer {_GUEST_BEARER}",
-                        "User-Agent": "Mozilla/5.0",
-                    },
-                )
-                if r.status_code == 200:
-                    token = r.json().get("guest_token")
-                    if token:
-                        import time as _t
-                        self._guest_token_cache = (token, _t.time())
-                        return token
-        except Exception as e:
-            logger.debug(f"guest token error: {e}")
-        return None
-
-    async def _verify_search_ban_via_guest_api(self, handle: str) -> Optional[bool]:
-        """
-        from:@handle を X の検索 API で叩く。
-        ツイートが 0 件 → search_ban の可能性が高い（完全には断言できない）。
-        None を返すと「不明」として扱う。
-        """
-        token = await self._get_guest_token()
-        if not token:
-            return None
-        try:
-            url = _SEARCH_URL.format(handle=handle)
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                r = await client.get(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {_GUEST_BEARER}",
-                        "x-guest-token": token,
-                        "User-Agent": "Mozilla/5.0",
-                        "x-twitter-active-user": "yes",
-                        "x-twitter-client-language": "ja",
-                        "Referer": "https://twitter.com/",
-                        "Accept": "application/json",
-                    },
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    tweets = (
-                        data.get("globalObjects", {}).get("tweets", {})
-                        or data.get("data", {}).get("search_by_raw_query", {})
-                        .get("search_timeline", {})
-                        .get("timeline", {})
-                        .get("instructions", [{}])[0]
-                        .get("entries", [])
-                    )
-                    if isinstance(tweets, dict):
-                        return len(tweets) == 0
-                    elif isinstance(tweets, list):
-                        return len(tweets) == 0
-                    return None
-        except Exception as e:
-            logger.debug(f"[@{handle}] guest search error: {e}")
-        return None
 
 
 class ShadowbanResolver:

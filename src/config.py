@@ -12,7 +12,10 @@ class ProxyConfig(BaseModel):
     username: str
     password: str
     country: str = ""                # 空文字 = 混合IP（国指定なし、最安）。"jp" で日本IP固定
-    sticky_ttl_minutes: int = 30
+    sticky_ttl_minutes: int = 30     # 互換用（未使用）。実際の維持時間は session_lifetime_minutes
+    # スティッキーセッションの維持時間。垢は数週間ウォームアップするので IPRoyal の最大(7日)を既定に。
+    session_lifetime_minutes: int = 10080
+    killswitch: bool = True          # IP を失ったら黙って別 IP に変わらず 410 を返す（IPRoyal）
     max_accounts_per_ip: int = 5
 
 
@@ -70,6 +73,12 @@ class LoggingConfig(BaseModel):
 class WarmupConfig(BaseModel):
     min_days_before_sale: int = 21       # HStoraレベル: 21日以上
     actions_per_day_soft: int = 8
+    require_graduation: bool = False     # True: /pop は卒業テスト合格済みの垢だけ払い出す
+    graduation_min_days: int = 21
+    graduation_min_active_days: int = 10 # 実際に行動した日数の下限
+    graduation_min_tweets: int = 8
+    graduation_max_unplanned_ip_changes: int = 0
+    graduation_max_attempts: int = 5     # 卒業テスト不合格の上限回数
 
 
 class AppConfig(BaseModel):
